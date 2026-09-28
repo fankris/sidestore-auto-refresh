@@ -3,10 +3,10 @@ name: LiveContainer embedded SideStore build
 on:
   workflow_dispatch:
   push:
-    branches: [fix/combined-refresh-build-and-runtime]
+    branches: [main, fix/combined-refresh-build-and-runtime]
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: livecontainer-${{ github.ref }}
@@ -128,6 +128,12 @@ jobs:
             plutil -extract BGTaskSchedulerPermittedIdentifiers.0 raw work/LiveContainer/LiveContainer/Info.plist
             grep -Fq 'LIVE_REFRESH_LOG_RETENTION_V1' work/EmbeddedSideStore/SideStore/Utils/iostreams/ConsoleLog.swift
           } 2>&1 | tee artifacts/logs/host-preflight.log
+
+      - name: Apply Chinese and bilingual localization
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 builder/.github/scripts/apply_bilingual_localization.py work/LiveContainer work/EmbeddedSideStore
 
       - name: Install build tools
         run: |
@@ -285,3 +291,21 @@ jobs:
           path: artifacts/logs
           if-no-files-found: warn
           retention-days: 7
+
+      - name: Publish GitHub Release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v3.0.2-chinese-bilingual
+          name: "LiveContainer + SideStore Auto-Refresh (中英双语自适应版)"
+          body: |
+            ### LiveContainer + SideStore Auto-Refresh (中英双语自适应版)
+
+            基于 NRG-Wardog/sidestore-auto-refresh 原版结构构建：
+            - **中英双语自适应**：中文系统下全界面（容器主页、设置、二级菜单、SideStore 设置与自动续签）原生自适应呈现简体中文，英文系统保持原版英文。
+            - **零侵入**：未篡改任何 Storyboard 控件与代码闭包，所有 App 点击正常、手势与多任务毛玻璃完整保留。
+            - **核心功能**：完整保留 LocalDevVPN / CoreDevice RSD 本地静默自动续签。
+          files: |
+            artifacts/LiveContainer-SideStore-AutoRefresh.ipa
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
