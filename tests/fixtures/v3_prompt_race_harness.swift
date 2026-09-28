@@ -79,8 +79,8 @@ struct PromptRaceHarness {
         let answer = try await waiter.value
         precondition(answer["action"] == "sms")
         precondition(center.pendingCount == 0, "answered continuation was retained")
-        precondition(center.answer(promptID: prompt, answer: ["action": "voice"]) == .unavailable,
-                     "a consumed prompt cannot accept another response")
+        precondition(center.answer(promptID: prompt, answer: ["action": "voice"]) == .alreadySettled,
+                     "a duplicate remains settled after the continuation and prompt box are removed")
         print("V3_PROMPT_RACE_PASS")
     }
 }

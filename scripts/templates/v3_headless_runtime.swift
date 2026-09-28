@@ -64,8 +64,10 @@ final class V3PromptCenter: @unchecked Sendable {
     private final class Pending: @unchecked Sendable {
         var continuation: CheckedContinuation<[String: String], Error>?
         var result: Result<[String: String], Error>?
+        var wasAnswered = false
     }
     private var boxes: [String: Pending] = [:]
+    private var recentlyAnsweredPromptIDs: [String] = []
     var pendingCount: Int {
         lock.lock()
         defer { lock.unlock() }
@@ -106,18 +108,26 @@ final class V3PromptCenter: @unchecked Sendable {
     }
 
     func answer(promptID: String, answer: [String: String]) -> V3PromptAnswerDisposition {
-        lock.lock()
-        let pending = boxes[promptID]
-        lock.unlock()
-        guard let pending else { return .unavailable }
-        if settle(promptID: promptID, pending: pending, result: .success(answer)) { return .accepted }
-        lock.lock()
-        let stillPresent = boxes[promptID] === pending
-        let alreadyAnswered: Bool
-        if case .success? = pending.result { alreadyAnswered = true }
-        else { alreadyAnswered = false }
-        lock.unlock()
-        return stillPresent && alreadyAnswered ? .alreadySettled : .unavailable
+        let transition = lock.withLock { () -> (V3PromptAnswerDisposition, CheckedContinuation<[String: String], Error>?) in
+            guard let pending = boxes[promptID] else {
+                return (recentlyAnsweredPromptIDs.contains(promptID) ? .alreadySettled : .unavailable, nil)
+            }
+            guard case nil = pending.result else {
+                return (pending.wasAnswered ? .alreadySettled : .unavailable, nil)
+            }
+            pending.wasAnswered = true
+            pending.result = .success(answer)
+            let continuation = pending.continuation
+            pending.continuation = nil
+            recentlyAnsweredPromptIDs.removeAll { $0 == promptID }
+            recentlyAnsweredPromptIDs.append(promptID)
+            if recentlyAnsweredPromptIDs.count > 256 {
+                recentlyAnsweredPromptIDs.removeFirst(recentlyAnsweredPromptIDs.count - 256)
+            }
+            return (.accepted, continuation)
+        }
+        if transition.0 == .accepted { transition.1?.resume(returning: answer) }
+        return transition.0
     }
 
     @discardableResult
