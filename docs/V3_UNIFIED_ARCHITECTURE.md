@@ -225,11 +225,16 @@ provisioning decision crosses to the host as data. The pinned SideSign tree
 carries the official `Connection: close` fix in both GrandSlam request
 builders (`sendAuthenticationRequest` for initial auth and
 `makeTwoFactorAuthRequest` for trusted-device, SMS, voice and code
-submission); no builder patch modifies those sources. Auth sessions are
-single-flight per service process (a new begin cancels the previous one),
-every retry is user-driven, and auth/open-operation prompts are logged with
-session, kind, attempt and terminal stage/code only - never credentials,
-codes, tokens or headers.
+submission). A narrowly scoped, version-checked build transform also changes
+`com.apple.dt.Xcode[/version]` to `com.apple.akd/1.0` only in those two
+`X-MMe-Client-Info` headers; it leaves other headers and Anisette values
+untouched. The controlled reports motivating this are third-party evidence,
+not Apple documentation, and device login is still a separate acceptance
+check. Auth sessions are single-flight per service process (a new begin
+cancels the previous one), every retry is user-driven, 429 is shown as a
+rate limit with wait guidance, and prompts are logged with session, kind,
+attempt and terminal stage/code only - never credentials, codes, tokens or
+headers.
 
 Readiness failures preserve their structured codes: `failed()` forwards an
 already structured `CombinedFailure` (for example the probe's

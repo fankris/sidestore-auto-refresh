@@ -1,8 +1,10 @@
 # Issue #18 (Apple ID 503/429) and SideStore service-readiness failure
 
-Final investigation report. Candidate: `64713a1b465749b6a06bd25b7b1198aad8fb596f`
-(v3.0.2 line; v3.0.1 is frozen and untouched).
-CI: `livecontainer-build.yml` run `35450558929` — success.
+Investigation record. The earlier candidate was `64713a1b465749b6a06bd25b7b1198aad8fb596f`
+(v3.0.2 line; v3.0.1 is frozen and untouched); it did not establish
+resolution of Issue #18 on affected devices. A later client-identity finding
+and source-level follow-up are documented below.
+Historical CI: `livecontainer-build.yml` run `35450558929` — success.
 https://github.com/NRG-Wardog/sidestore-auto-refresh/actions/runs/35450558929
 
 The two investigations were kept separate: Issue #18 is an
@@ -39,8 +41,9 @@ and asserts:
   `makeTwoFactorAuthRequest` (all four 2FA send sites: trusted device,
   phone SMS/voice, code validation),
 * exactly 2 `URLRequest(` builders in that file — no third GSA path,
-* no builder script modifies SideSign sources (only read-only evidence
-  collection references `Dependencies/`).
+* this is the unmodified pinned upstream baseline; the follow-up build adds
+  one version-checked transform to `Authentication.swift` for the client-info
+  token only, with replay/diff checks in CI.
 
 The pinned ref is 16 commits ahead of the official fix
 `35993d7f68950ce00d6bf1fd0fbcaa7bef51dc9c` ("close connection for gsa
@@ -48,12 +51,26 @@ after each call coz otherwise it triggers 5XX due to connection reuse")
 and 0 behind. Developer-portal (post-auth) requests use a different host
 and are unaffected by the GSA fix, as intended.
 
-### 503 analysis
+### 503 analysis — two distinct causes
 
-With connection reuse eliminated at both GSA builders, a 503 is
-server-side or throttling rather than client connection reuse. The
-preserved stage/code vocabulary now distinguishes it instead of
-collapsing it into a generic failure.
+The pinned upstream `Connection: close` fix addresses GSA connection reuse,
+but it does not address a separate client-identity rejection. [AltStore PR
+#1790](https://github.com/altstoreio/AltStore/pull/1790) and [Issue #8 in
+Sank6/iCloud-Keychain-for-Linux](https://github.com/Sank6/iCloud-Keychain-for-Linux/issues/8)
+report controlled requests where `X-MMe-Client-Info` containing
+`com.apple.dt.Xcode` returned an HTML 503, while replacing that token with
+`com.apple.akd/1.0` returned a valid GSA plist. These are third-party
+observations, not an Apple policy statement; the AltStore PR is not merged.
+
+The pinned SideSign builders pass `anisetteData.clientInfo` to the initial
+GSA request and `a.clientInfo` to 2FA. The build now applies a version-checked,
+fail-closed transform to those two header values only: if the sub-identity is
+`com.apple.dt.Xcode[/version]`, it becomes `com.apple.akd/1.0`. Other client
+identities, User-Agent, anisette fields, credentials and request bodies are
+unchanged. This fixes the observed header condition in the prepared source;
+physical login/2FA acceptance remains unverified. A 503 after this transform
+still requires the actual stage and sanitized HTTP response details before
+attributing it to a cause.
 
 ### 429 analysis
 
@@ -61,14 +78,18 @@ No uncontrolled retry exists in the v3 auth path: every submit is
 user-driven, `V3AuthCenter` is single-flight (a new begin cancels the
 previous session), the bridge mutation gate serializes concurrent auth
 attempts, and poll loops are cheap reads. Upstream `authenticationLoop`
-waits on `credentials()` (user-paced); nothing auto-resubmits.
-10 newer SideSign commits touch only packaging/bundle parsing — nothing
-auth-relevant to integrate, so no dependency change is justified.
+waits on `credentials()` (user-paced); nothing auto-resubmits. HTTP 429 and
+GrandSlam throttling codes map to `rateLimited`, with guidance to wait before
+trying again. The app intentionally does not add a retry/backoff request
+that could amplify Apple's rate limit.
 
 ### Fixes made
 
 * `[V3_AUTH]` / `[V3_OP]` console markers (session, kind, attempt,
   terminal stage/code only — never credentials, codes, tokens, headers).
+* Build-time GSA client identity normalization for initial auth and 2FA,
+  alongside upstream `Connection: close`; pinned-source and idempotence
+  regression tests cover the request builders and token transformation.
 * Prompt-kind closed set, single-flight and no-retry-loop regression
   tests (`GsaPreparedTreeTests`, wire-contract session tests, prompt-gate
   execution test).

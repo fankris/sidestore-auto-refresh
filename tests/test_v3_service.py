@@ -965,7 +965,7 @@ class GsaPreparedTreeTests(unittest.TestCase):
         self.assertEqual(enclosing, ["sendAuthenticationRequest", "makeTwoFactorAuthRequest"])
         self.assertEqual(len(re.findall(r"URLRequest\(", text)), 2)
 
-    def test_no_builder_patch_modifies_sidesign_auth(self):
+    def test_only_explicit_patches_modify_sidesign_auth(self):
         scripts = (ROOT / "scripts").glob("*.py")
         for script in scripts:
             content = script.read_text(encoding="utf-8")
@@ -976,6 +976,11 @@ class GsaPreparedTreeTests(unittest.TestCase):
             if script.name == "patch_sidesign_2fa_state.py":
                 self.assertIn("Authentication.swift", content)
                 self.assertIn("DeveloperPortalAPI.swift", content)
+                continue
+            if script.name == "patch_sidesign_gsa_client_info.py":
+                self.assertIn("Sources/DeveloperPortal/Authentication.swift", content)
+                self.assertIn("X-MMe-Client-Info", content)
+                self.assertIn("V3_GSA_AKD_CLIENT_INFO_V1", content)
                 continue
             self.assertNotIn("DeveloperPortal/Authentication", content)
         medic = (ROOT / "scripts/combined_build_evidence.py").read_text(encoding="utf-8")
