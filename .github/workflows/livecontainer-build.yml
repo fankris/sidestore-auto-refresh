@@ -3,10 +3,10 @@ name: LiveContainer embedded SideStore build
 on:
   workflow_dispatch:
   push:
-    branches: [fix/combined-refresh-build-and-runtime]
+    branches: [main, fix/combined-refresh-build-and-runtime]
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: livecontainer-${{ github.ref }}
@@ -147,6 +147,12 @@ jobs:
             plutil -extract BGTaskSchedulerPermittedIdentifiers.0 raw work/LiveContainer/LiveContainer/Info.plist
             grep -Fq 'LIVE_REFRESH_LOG_RETENTION_V1' work/EmbeddedSideStore/SideStore/Utils/iostreams/ConsoleLog.swift
           } 2>&1 | tee artifacts/logs/host-preflight.log
+
+      - name: Apply Chinese and bilingual localization
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 builder/.github/scripts/apply_bilingual_localization.py work/LiveContainer work/EmbeddedSideStore
 
       - name: Execute real layout regression on final generated source
         shell: bash
@@ -353,3 +359,22 @@ jobs:
           path: artifacts/debug-evidence
           if-no-files-found: warn
           retention-days: 90
+
+      - name: Publish GitHub Release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v3.0.2-chinese-bilingual
+          name: "LiveContainer + SideStore Auto-Refresh v3.0.2 (深度全面中文自适应版)"
+          body: |
+            ## LiveContainer + SideStore Auto-Refresh v3.0.2 (深度全面中文自适应版)
+
+            基于官方真实 `v3.0.2` 发行版核心（Commit: `35c6c28`）构建，具备完整的 Unified v3 架构：
+            - **完全无头 SideStore（Fully Headless）**：证书管理、Apple ID 登录与两步验证、配对管理、LocalDevVPN 隧道、Anisette 配置全面由 LiveContainer 原生 SwiftUI 宿主接管。
+            - **开机配置向导（Setup Assistant）**：设备、配对、网络、后台刷新调度全套自检引导。
+            - **统一刷新管理器（Unified Refresh Manager）**：直达导航与后台 CoreDevice 自动续签。
+            - **全面深度中文本地化**：中文系统下全界面（LiveContainer 容器、设置、二级菜单、配置向导、SideStore 证书管理与自动续签）原生自适应呈现简体中文；英文系统保持原汁原味。
+            - **原生运行环境**：完全在官方认证的 `macos-26` + `Xcode 26.4` 环境下编译，绝不篡改任何 Storyboard 结构与 Swift 闭包。
+          files: |
+            artifacts/LiveContainer-SideStore-AutoRefresh.ipa
+          token: ${{ secrets.GITHUB_TOKEN }}
