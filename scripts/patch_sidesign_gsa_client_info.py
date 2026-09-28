@@ -10,14 +10,10 @@ PIN = "a731c0d5a9a6617c7b385ae493e07ffb7f81cd5d"
 MARKER = "V3_GSA_AKD_CLIENT_INFO_V1"
 AUTH = Path("Sources/DeveloperPortal/Authentication.swift")
 
-HELPER = r'''// V3_GSA_AKD_CLIENT_INFO_V1: Apple GSA currently rejects the Xcode client token.
+HELPER = r'''// V3_GSA_AKD_CLIENT_INFO_V1: normalize the client token implicated in reported GSA 503s.
 private func v3GsaClientInfo(_ clientInfo: String) -> String {
     guard let marker = clientInfo.range(of: "com.apple.dt.Xcode") else { return clientInfo }
     let suffix = clientInfo[marker.upperBound...]
-    guard let first = suffix.first,
-          first == "/" || first == ")" || first == ">" || first.isWhitespace else {
-        return clientInfo
-    }
     let tokenEnd = suffix.firstIndex(where: { $0 == ")" || $0 == ">" || $0.isWhitespace }) ?? suffix.endIndex
     return String(clientInfo[..<marker.lowerBound]) + "com.apple.akd/1.0" + String(suffix[tokenEnd...])
 }

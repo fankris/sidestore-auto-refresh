@@ -59,11 +59,11 @@ class SideSignGsaClientInfoPatchTests(unittest.TestCase):
                 patcher.patch(root, enforce_pin=False)
             self.assertEqual(source.read_text(encoding="utf-8"), drifted)
 
-    def test_swift_normalizer_replaces_only_the_xcode_identity_and_its_version(self):
+    def test_swift_normalizer_replaces_xcode_tokens_and_preserves_non_xcode_identities(self):
         compiler = shutil.which("swiftc")
         if not compiler:
             self.skipTest("Swift compiler unavailable")
-        program = patcher.HELPER + r'''
+        program = "import Foundation\n" + patcher.HELPER + r'''
 let cases: [(String, String)] = [
     ("<MacBookPro15,1> <Mac OS X;10.15.2;19C57> <com.apple.AuthKit/1 (com.apple.dt.Xcode/3594.4.19)>",
      "<MacBookPro15,1> <Mac OS X;10.15.2;19C57> <com.apple.AuthKit/1 (com.apple.akd/1.0)>") ,
@@ -71,7 +71,8 @@ let cases: [(String, String)] = [
      "<MacBookPro13,2> <macOS;14.4;23E214> <com.apple.AuthKit/1 (com.apple.akd/1.0)>") ,
     ("<MacBookPro13,2> <macOS;14.4;23E214> <com.apple.akd/1.0>",
      "<MacBookPro13,2> <macOS;14.4;23E214> <com.apple.akd/1.0>") ,
-    ("<com.apple.dt.XcodeExperimental/1>", "<com.apple.dt.XcodeExperimental/1>")
+    ("com.apple.dt.Xcode", "com.apple.akd/1.0"),
+    ("<com.apple.dt.XcodeExperimental/1>", "<com.apple.akd/1.0>")
 ]
 for (input, expected) in cases {
     precondition(v3GsaClientInfo(input) == expected)

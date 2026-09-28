@@ -19,10 +19,11 @@ Issue 24 is integrated in both rebuilt combined candidates. Their source retains
 upstream SideStore ff25922e5c13ccfafd83bda5092910d848ebd409, minimuxer
 98c3c79982f813878e922ab42f9545314a700f0c, SideSign
 a731c0d5a9a6617c7b385ae493e07ffb7f81cd5d and its GSA fix ancestry. The combined
-build also normalizes the reported Xcode sub-identity in both GSA request builders;
-this source-level fix does not establish device login/2FA success or resolve HTTP
-429 rate limits. Standalone has a separate build identity and is not rebuilt or
-redesigned for these combined fixes.
+build also normalizes the reported Xcode sub-identity in both GSA request builders
+and classifies HTTP 429 as rate-limited without automatic retries. These source-level
+fixes do not establish device login/2FA success or bypass HTTP 429 rate limits.
+Standalone has a separate build identity and is not rebuilt or redesigned for these
+combined fixes.
 
 ## Physical-device acceptance
 

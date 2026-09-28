@@ -269,10 +269,10 @@ jobs:
           git -C "$MUX" diff --check
           while IFS= read -r -d '' source; do swiftc -frontend -parse "$source"; done < <(find "$MUX" -type f -name '*.swift' -not -path '*/.build/*' -print0)
           swift package --package-path "$MUX/DeviceGateway" dump-package >"$RUNNER_TEMP/combined-gateway-package.json"
-          # Keep the pinned SideSign/Anisette baseline. The explicit GSA
-          # compatibility transform below changes only the blocked Xcode client
-          # token in the initial and 2FA X-MMe-Client-Info headers. Core
-          # Auth/AppManager headless adapters remain exact pinned transforms.
+          # Keep the pinned SideSign/Anisette baseline. Narrow build transforms
+          # normalize only the reported Xcode token in GSA client-info headers
+          # and map HTTP 429 before body parsing; they add no retry or credentials.
+          # Core Auth/AppManager headless adapters remain exact pinned transforms.
           git -C work/EmbeddedSideStore diff --exit-code -- SideStore/Core/Anisette
           expected_auth=$(printf '%s\n' \
             'AltStore/Managing Apps/AppManager.swift' \
@@ -292,7 +292,10 @@ jobs:
           python3 builder/scripts/patch_sidesign_2fa_state.py "$SIDESIGN"
           python3 builder/scripts/patch_sidesign_gsa_client_info.py "$SIDESIGN"
           python3 builder/scripts/patch_sidesign_gsa_client_info.py "$SIDESIGN"
-          printf 'gsa_client_info_patch=%s\n' 'V3_GSA_AKD_CLIENT_INFO_V1' >> artifacts/logs/upstream-auth-provenance.txt
+          python3 builder/scripts/patch_sidesign_gsa_rate_limit.py "$SIDESIGN"
+          python3 builder/scripts/patch_sidesign_gsa_rate_limit.py "$SIDESIGN"
+          printf 'gsa_client_info_patch=%s\ngsa_http_429_patch=%s\n' \
+            'V3_GSA_AKD_CLIENT_INFO_V1' 'V3_GSA_HTTP_429_CLASSIFICATION_V1' >> artifacts/logs/upstream-auth-provenance.txt
           git -C "$SIDESIGN" diff --check
           expected_sidesign=$(printf '%s\n' \
             'Sources/DeveloperPortal/Authentication.swift' \

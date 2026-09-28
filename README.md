@@ -21,7 +21,7 @@ For v3 setup, use **Settings → Account and Signing → Sign In / Authenticate*
 
 Startup-recovery candidates are built on `fix/v3-startup-errors`; use the full builder SHA and matching CI evidence attached to the draft, not a mutable branch as package identity. Settings > Build Candidate reports the product line, builder commit and run. Install over the existing combined app with matching signing identity and app identifiers; no reset is part of the upgrade. List, Grid and Compact List retain `LCAppLayoutStyle`. Physical-device acceptance is separate from CI evidence. These candidates remain draft prereleases, not a v3 production-readiness announcement.
 
-The [startup crash investigation](docs/COMBINED_STARTUP_CRASH.md) records the exact binary match and remaining device uncertainty. Both corrected combined lines include Issue #24 error propagation; standalone packages retain their separate provenance. The combined build includes the reported Xcode-client GSA header workaround, but that does not establish physical-device login/2FA success or resolve HTTP 429 rate limits.
+The [startup crash investigation](docs/COMBINED_STARTUP_CRASH.md) records the exact binary match and remaining device uncertainty. Both corrected combined lines include Issue #24 error propagation; standalone packages retain their separate provenance. The combined build includes the reported Xcode-client GSA header workaround and maps HTTP 429 to wait guidance without retrying; neither guarantees physical-device login/2FA success nor bypasses Apple's rate limits.
 
 See [the v3 architecture document](docs/V3_UNIFIED_ARCHITECTURE.md) for the implementation, ownership, upstream authentication review and validation details.
 

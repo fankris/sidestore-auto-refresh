@@ -78,10 +78,12 @@ No uncontrolled retry exists in the v3 auth path: every submit is
 user-driven, `V3AuthCenter` is single-flight (a new begin cancels the
 previous session), the bridge mutation gate serializes concurrent auth
 attempts, and poll loops are cheap reads. Upstream `authenticationLoop`
-waits on `credentials()` (user-paced); nothing auto-resubmits. HTTP 429 and
-GrandSlam throttling codes map to `rateLimited`, with guidance to wait before
-trying again. The app intentionally does not add a retry/backoff request
-that could amplify Apple's rate limit.
+waits on `credentials()` (user-paced); nothing auto-resubmits. The build now
+maps raw HTTP 429 to `tooManyAttempts` before body/XML parsing on initial GSA,
+trusted-device and SMS/voice requests; verification already checks 429 before
+XML handling. GrandSlam throttling codes map to the same `rateLimited` UI
+state with guidance to wait. The app intentionally does not add a retry or
+backoff request that could amplify Apple's rate limit.
 
 ### Fixes made
 

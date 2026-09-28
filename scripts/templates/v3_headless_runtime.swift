@@ -261,6 +261,8 @@ func v3AuthFailureStage(_ kind: V3AuthFailureKind) -> CombinedFailure.Stage {
 // - incorrectCredentials: GrandSlam ec -22406
 // - appSpecificPasswordRequired: GrandSlam ec -20101 / -20209
 // - tooManyAttempts: GrandSlam ec -21668 / -20102 / -22411, or HTTP 429
+//   (pre-parse in initial GSA, trusted-device and SMS/voice; verification checks
+//   it before XML-alert handling)
 // - incorrectVerificationCode: wrong 2FA code (returns to credentials prompt)
 // - invalidAnisetteData: Anisette infrastructure failure
 // - accountRepairRequired: Apple requires account attention

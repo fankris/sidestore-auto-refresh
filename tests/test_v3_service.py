@@ -982,6 +982,11 @@ class GsaPreparedTreeTests(unittest.TestCase):
                 self.assertIn("X-MMe-Client-Info", content)
                 self.assertIn("V3_GSA_AKD_CLIENT_INFO_V1", content)
                 continue
+            if script.name == "patch_sidesign_gsa_rate_limit.py":
+                self.assertIn("Sources/DeveloperPortal/Authentication.swift", content)
+                self.assertIn("HTTPStatusCodes.tooManyRequests", content)
+                self.assertIn("V3_GSA_HTTP_429_CLASSIFICATION_V1", content)
+                continue
             self.assertNotIn("DeveloperPortal/Authentication", content)
         medic = (ROOT / "scripts/combined_build_evidence.py").read_text(encoding="utf-8")
         self.assertNotIn("Dependencies/SideSign", medic)
