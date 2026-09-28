@@ -2,6 +2,12 @@ name: LiveContainer embedded SideStore build
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish the tagged v3.0.3 release (explicit opt-in)"
+        required: false
+        type: boolean
+        default: false
   push:
     branches: [main, fix/combined-refresh-build-and-runtime, fix/v3.0.3-auth-errors]
 
@@ -407,7 +413,7 @@ jobs:
           retention-days: 90
 
       - name: Publish GitHub Release
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.publish_release == true
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v3.0.3-chinese-bilingual

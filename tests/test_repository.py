@@ -151,6 +151,7 @@ class RepositoryTests(unittest.TestCase):
         self.assertIn("builder/scripts/" + V3_UNIFIED_SHELL_SCRIPT, live_workflow)
         self.assertIn("builder/scripts/patch_sidesign_2fa_state.py", live_workflow)
         self.assertIn("builder/scripts/patch_sidesign_gsa_client_info.py", live_workflow)
+        self.assertIn("inputs.publish_release == true", live_workflow)
         standalone_workflow = (ROOT / ".github/workflows/build-current.yml").read_text(encoding="utf-8")
         self.assertIn("builder/scripts/patch_app_layout.py", standalone_workflow)
         contract = (SCRIPTS / COMBINED_REFRESH_SCRIPT).read_text(encoding="utf-8")
