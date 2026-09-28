@@ -3628,6 +3628,13 @@ enum V3AuthTerminalFailureAction: Equatable {
     case blocked
 }
 
+enum V3AuthAnisetteRemoteSyncPolicy {
+    static func shouldSyncRemote(useOnDeviceAnisette: Bool, offlineMode: Bool,
+                                 activeServerCount: Int) -> Bool {
+        !useOnDeviceAnisette && !offlineMode && activeServerCount == 0
+    }
+}
+
 enum V3AuthTerminalFailureActionPolicy {
     static func resolve(kind: String?, retryable: Bool?) -> V3AuthTerminalFailureAction {
         switch kind {

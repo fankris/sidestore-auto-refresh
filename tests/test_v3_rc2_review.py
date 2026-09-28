@@ -425,7 +425,7 @@ class ReloadStatusVisibilityTests(unittest.TestCase):
     def test_loading_wins_over_connected_and_the_time_is_shown(self):
         text = shell()
         header = text[text.index("struct V3HomeServiceHeader"):text.index("private struct V3HomeView")]
-        self.assertIn('Text(isLoading ? "Reloading Status..." : "Reload Status")', header)
+        self.assertIn('Text(v3LocalizedString(isLoading ? "Reloading Status..." : "Reload Status"))', header)
         self.assertIn("V3StatusPresentation.connectionState(connected: isConnected, loading: isLoading)", header)
         self.assertIn("if isLoading {", header)
         self.assertIn("ProgressView()", header)
@@ -433,7 +433,7 @@ class ReloadStatusVisibilityTests(unittest.TestCase):
         # The old ordering is gone.
         self.assertNotIn('isConnected ? "Active & Connected"', header)
         # Meaning never depends on colour alone.
-        self.assertIn("Label(statusPresentation.title, systemImage: statusPresentation.icon)", header)
+        self.assertIn("Label(v3LocalizedString(statusPresentation.title), systemImage: statusPresentation.icon)", header)
 
     def test_connection_state_model_puts_loading_first(self):
         primitives_text = primitives()

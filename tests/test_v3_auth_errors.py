@@ -265,7 +265,7 @@ class V3AuthErrorTests(unittest.TestCase):
 
     def test_failed_unconfirmed_cancel_has_an_available_retry_action(self):
         host = shell()
-        self.assertIn('Button(auth.cancellationWasAttempted ? "Retry Cancellation" : "Cancel Unconfirmed Sign-In"', host)
+        self.assertIn('Button(v3LocalizedString(auth.cancellationWasAttempted ? "Retry Cancellation" : "Cancel Unconfirmed Sign-In")', host)
         self.assertIn("V3AuthCancellationRetryPolicy.canRetry", host)
         cancel = host[host.index("func cancel() {", host.index("final class V3AuthStore")):]
         self.assertIn("canRetryCancellation", cancel)

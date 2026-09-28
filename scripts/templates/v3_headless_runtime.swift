@@ -653,7 +653,12 @@ final class V3AuthCenter {
             let operation = try SignInOperation(context: context, signInHandler: handler,
                 anisetteServerHandler: handler, v3ForceProvisioningRetry: forceProvisioningRetry)
             let result = try await operation.execute()
-            let account = result.team.account ?? ALTAccount(appleID: "", identifier: result.team.identifier)
+            let submitted = sessions[id]?.submittedAppleID ?? ""
+            let teamAppleID = result.team.account?.appleID ?? ""
+            let currentAppleID = AuthManager.shared.currentAppleID ?? ""
+            let effectiveAppleID = !teamAppleID.isEmpty ? teamAppleID :
+                (!submitted.isEmpty ? submitted : currentAppleID)
+            let account = result.team.account ?? ALTAccount(appleID: effectiveAppleID, identifier: result.team.identifier)
             await handler.handleSignInResult(.success((account, result.session)))
             sessions[id]?.prompt = nil
             resumableProvisioning = nil
@@ -1043,10 +1048,24 @@ final class V3HeadlessAuthHandler: SignInHandler, AnisetteServerHandler {
     func handleSignInResult(_ result: Result<(ALTAccount, ALTAppleAPISession), Error>) async {
         guard V3HeadlessRuntime.shared.auth.sessions[sessionID]?.terminal.isEmpty == true else { return }
         switch result {
-        case .success(let (account, _)):
+        case .success(let (account, session)):
             V3HeadlessRuntime.shared.auth.sessions[sessionID]?.previousFailure = nil
-            V3HeadlessRuntime.shared.auth.sessions[sessionID]?.authenticatedAppleID =
-                account.appleID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let accountAppleID = account.appleID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let submittedAppleID = V3HeadlessRuntime.shared.auth.sessions[sessionID]?.submittedAppleID
+            let currentAppleID = AuthManager.shared.currentAppleID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let resolvedAppleID: String?
+            if !accountAppleID.isEmpty {
+                resolvedAppleID = accountAppleID
+            } else if let submittedAppleID, !submittedAppleID.isEmpty {
+                resolvedAppleID = submittedAppleID
+            } else {
+                resolvedAppleID = currentAppleID
+            }
+            V3HeadlessRuntime.shared.auth.sessions[sessionID]?.authenticatedAppleID = resolvedAppleID
+            AuthManager.shared.session = session
+            if let resolvedAppleID, !resolvedAppleID.isEmpty {
+                AuthManager.shared.currentAppleID = resolvedAppleID
+            }
         case .failure(let error):
             guard let kind = v3ClassifyAuthError(error) else {
                 V3HeadlessRuntime.shared.auth.sessions[sessionID]?.previousFailure = nil

@@ -11,7 +11,7 @@ import sys
 TEMPLATES = Path(__file__).with_name("templates")
 PINS = ("12377cf3b91d51739a33f14a302e5f522b238593", "ff25922e5c13ccfafd83bda5092910d848ebd409")
 MARKER = "V3_COMMAND_PATCH_V1"
-PATCH_VERSION = 24
+PATCH_VERSION = 25
 HEADLESS_SIDESTORE_VIEW_FILES = (
     "Views/Components/AppInfoView.swift",
     "Views/Components/BundleResourceBrowserView.swift",
@@ -551,6 +551,10 @@ def patch_sign_in_operation(text):
             "if self.isCancelled || error is CancellationError || v3ClassifyAuthError(error) == nil",
             "if self.v3ForceProvisioningRetry {",
             "!(error is V3ProvisioningResumeUnavailableError)",
+            "V3_AUTH_ATTEMPT_SESSION_PRESERVATION_V1",
+            "v3AuthenticatedDuringThisOperation",
+            "V3_ANISSETTE_REMOTE_PREFLIGHT_V1",
+            "V3AuthAnisetteRemoteSyncPolicy.shouldSyncRemote",
         )
         if text.count(marker) != 1 or any(value not in text for value in required):
             raise SystemExit("v3 service: provisioning retry SignInOperation patch is partial")
@@ -560,7 +564,9 @@ def patch_sign_in_operation(text):
         "    let skipCertificateProvisioning: Bool\n",
         "    let skipCertificateProvisioning: Bool\n"
         "    // V3_PROVISIONING_RETRY_BYPASSES_CACHED_SIGNIN_V1\n"
-        "    let v3ForceProvisioningRetry: Bool\n")
+        "    let v3ForceProvisioningRetry: Bool\n"
+        "    // V3_AUTH_ATTEMPT_SESSION_PRESERVATION_V1\n"
+        "    var v3AuthenticatedDuringThisOperation = false\n")
     text = replace(text,
         "        skipCertificateProvisioning: Bool = false\n",
         "        skipCertificateProvisioning: Bool = false,\n"
@@ -601,7 +607,12 @@ def patch_sign_in_operation(text):
         "        }\n"
         "        if let silentResult {\n"
         "            await self.signInHandler.handleSignInResult(.success(silentResult))\n"
+        "            self.v3AuthenticatedDuringThisOperation = true\n"
         "        }\n")
+    text = replace(text,
+        "                await handler.handleSignInResult(.success((account, session)))\n",
+        "                await handler.handleSignInResult(.success((account, session)))\n"
+        "                self.v3AuthenticatedDuringThisOperation = true\n")
     text = replace(text,
         "        while true {\n"
         "            let (appleID, password) = try await handler.credentials()\n",
@@ -631,10 +642,26 @@ def patch_sign_in_operation(text):
         "                    retryCredentials = (appleID, password)\n"
         "                }\n")
     text = replace(text,
+        "    private func getAnisetteData() async throws -> ALTAnisetteData {\n"
+        "        try await AnisetteProvider.fetch(handler: self.anisetteServerHandler)\n"
+        "    }\n",
+        "    private func getAnisetteData() async throws -> ALTAnisetteData {\n"
+        "        // V3_ANISSETTE_REMOTE_PREFLIGHT_V1: seed a fresh remote-mode install before fetching.\n"
+        "        let activeAnisetteServers = await AnisetteServersManager.shared.getActiveServerURLs()\n"
+        "        if V3AuthAnisetteRemoteSyncPolicy.shouldSyncRemote(\n"
+        "            useOnDeviceAnisette: UserDefaults.standard.bool(forKey: \"useOnDeviceAnisette\"),\n"
+        "            offlineMode: UserDefaults.standard.bool(forKey: \"isAnisetteOfflineMode\"),\n"
+        "            activeServerCount: activeAnisetteServers.count) {\n"
+        "            _ = try await AnisetteServersManager.shared.syncWithRemote()\n"
+        "        }\n"
+        "        return try await AnisetteProvider.fetch(handler: self.anisetteServerHandler)\n"
+        "    }\n")
+    text = replace(text,
         "            if !AuthManager.shared.hasStoredPassword &&\n"
         "               !AuthManager.shared.hasStoredXcodeToken\n",
         "            if !AuthManager.shared.hasStoredPassword &&\n"
         "               !AuthManager.shared.hasStoredXcodeToken &&\n"
+        "               !self.v3AuthenticatedDuringThisOperation &&\n"
         "               !(error is V3ProvisioningResumeUnavailableError)\n")
     return text
 

@@ -155,6 +155,11 @@ jobs:
             grep -Fq 'LIVE_REFRESH_LOG_RETENTION_V1' work/EmbeddedSideStore/SideStore/Utils/iostreams/ConsoleLog.swift
           } 2>&1 | tee artifacts/logs/host-preflight.log
 
+      - name: Apply Chinese bilingual localization
+        shell: bash
+        run: |
+          python3 builder/.github/scripts/apply_bilingual_localization.py work/LiveContainer work/EmbeddedSideStore
+
       - name: Execute real layout regression on final generated source
         shell: bash
         run: |
@@ -291,11 +296,6 @@ jobs:
             'SideStore/Core/Logging/SideStoreLogging.swift' | sort)
           actual_side_logging=$(git -C "$SIDESTORE" diff --name-only -- SideStore/Core/Logging | sort)
           test "$actual_side_logging" = "$expected_side_logging"
-
-      - name: Apply Chinese bilingual localization
-        shell: bash
-        run: |
-          python3 builder/.github/scripts/apply_bilingual_localization.py work/LiveContainer work/EmbeddedSideStore
 
       - name: Build host and embedded SideStore source targets
         shell: bash

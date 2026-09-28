@@ -457,7 +457,7 @@ class ReloadLabelTests(unittest.TestCase):
         header = text[start:end]
         # V3_RELOAD_STATUS_VISIBILITY_V1: the button names the action it is
         # currently performing, so a reload is never a silent no-op.
-        self.assertIn('Text(isLoading ? "Reloading Status..." : "Reload Status")', header)
+        self.assertIn('Text(v3LocalizedString(isLoading ? "Reloading Status..." : "Reload Status"))', header)
         self.assertIn('.lineLimit(1)', header)
         self.assertIn('.minimumScaleFactor(0.8)', header)
         self.assertIn('.fixedSize(horizontal: false, vertical: true)', header)
@@ -466,9 +466,9 @@ class ReloadLabelTests(unittest.TestCase):
         self.assertIn("if isLoading {", header)
         self.assertIn("ProgressView()", header)
         self.assertIn("if let updatedAt {", header)
-        self.assertIn('Text("Updated " + updatedAt.formatted', header)
+        self.assertIn('Text(v3LocalizedString("Updated ") + updatedAt.formatted', header)
         # State is never communicated by colour alone.
-        self.assertIn("Label(statusPresentation.title, systemImage: statusPresentation.icon)", header)
+        self.assertIn("Label(v3LocalizedString(statusPresentation.title), systemImage: statusPresentation.icon)", header)
         # The semantic name is exposed to assistive technology too.
         self.assertIn("statusPresentation.severityName", header)
         # The old ordering let a green "Active & Connected" win over a reload.
