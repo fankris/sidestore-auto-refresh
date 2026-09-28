@@ -11,7 +11,7 @@ import sys
 TEMPLATES = Path(__file__).with_name("templates")
 PINS = ("12377cf3b91d51739a33f14a302e5f522b238593", "ff25922e5c13ccfafd83bda5092910d848ebd409")
 MARKER = "V3_COMMAND_PATCH_V1"
-PATCH_VERSION = 25
+PATCH_VERSION = 26
 HEADLESS_SIDESTORE_VIEW_FILES = (
     "Views/Components/AppInfoView.swift",
     "Views/Components/BundleResourceBrowserView.swift",
@@ -648,9 +648,10 @@ def patch_sign_in_operation(text):
         "    private func getAnisetteData() async throws -> ALTAnisetteData {\n"
         "        // V3_ANISSETTE_REMOTE_PREFLIGHT_V1: seed a fresh remote-mode install before fetching.\n"
         "        let activeAnisetteServers = await AnisetteServersManager.shared.getActiveServerURLs()\n"
+        "        let serverCatalogOfflineMode = await AnisetteServersManager.shared.isOfflineMode\n"
         "        if V3AuthAnisetteRemoteSyncPolicy.shouldSyncRemote(\n"
         "            useOnDeviceAnisette: UserDefaults.standard.bool(forKey: \"useOnDeviceAnisette\"),\n"
-        "            offlineMode: UserDefaults.standard.bool(forKey: \"isAnisetteOfflineMode\"),\n"
+        "            offlineMode: UserDefaults.standard.bool(forKey: \"isAnisetteOfflineMode\") || serverCatalogOfflineMode,\n"
         "            activeServerCount: activeAnisetteServers.count) {\n"
         "            _ = try await AnisetteServersManager.shared.syncWithRemote()\n"
         "        }\n"

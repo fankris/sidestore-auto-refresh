@@ -481,7 +481,8 @@ class ReloadLabelTests(unittest.TestCase):
         renderer = (ROOT / "scripts/run_issue25_rendering.py").read_text(encoding="utf-8")
         self.assertIn("enum V3StatusSeverity: String, Equatable, CaseIterable {", renderer)
         self.assertIn("extension V3StatusPresentation {", renderer)
-        self.assertIn('"import SwiftUI\\n" + severity_model + "\\n" + tint_model + "\\n" + header', renderer)
+        self.assertIn('localization_start = text.index("private func v3LocalizedString', renderer)
+        self.assertIn('"import SwiftUI\\nimport Foundation\\n" + localization_helper + "\\n" + severity_model + "\\n" + tint_model + "\\n" + header', renderer)
         # The model is resolved from the shell or the primitives, and a missing
         # model fails loudly rather than silently rendering a stub.
         self.assertIn("v3_behavioral_primitives.swift", renderer)

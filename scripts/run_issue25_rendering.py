@@ -139,6 +139,9 @@ def build_v3_app(output: Path, live: Path, source: Path | None) -> tuple[Path, s
         "                        .background(FixtureGeometryProbe(id: \"reload-label\"))\n"
         "                } icon:", 1)
     generated_header = build / "V3HomeServiceHeader.swift"
+    localization_start = text.index("private func v3LocalizedString(_ value: String) -> String {")
+    localization_end = text.index("\n}\n", localization_start) + len("\n}\n")
+    localization_helper = text[localization_start:localization_end]
     # The Home header renders the shared semantic status model, so the real
     # production definitions are emitted alongside it rather than a stub. The
     # layout evidence is only meaningful if it renders the shipped types. The
@@ -163,7 +166,7 @@ def build_v3_app(output: Path, live: Path, source: Path | None) -> tuple[Path, s
         break
     if not severity_model or not tint_model:
         raise RuntimeError("Semantic status model not found for the Reload Status layout probe")
-    generated_header.write_text("import SwiftUI\n" + severity_model + "\n" + tint_model + "\n" + header)
+    generated_header.write_text("import SwiftUI\nimport Foundation\n" + localization_helper + "\n" + severity_model + "\n" + tint_model + "\n" + header)
     sources = [live / "LiveContainerSwiftUI/Models/AppLayoutStyle.swift", generated, generated_header,
                ROOT / "tests/fixtures/issue25_v3_rendering_harness.swift"]
     hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sources}
