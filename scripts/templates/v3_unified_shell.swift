@@ -2,6 +2,10 @@ import SwiftUI
 import Combine
 import SideStoreSupport
 import UniformTypeIdentifiers
+import UIKit
+import CoreFoundation
+import CryptoKit
+import Security
 
 // V3_UNIFIED_SHELL_V1_BEGIN
 enum V3AppIdentity: Hashable {
@@ -21,7 +25,6 @@ struct V3UnifiedShell: View {
 struct V3UnifiedTabs: View {
     @EnvironmentObject private var sharedModel: SharedModel
     @StateObject private var status = V3SideStoreStatusStore()
-    @State private var selectedInstallURL: URL?
     @State private var showNotificationsPrompt = false
     private let monitor = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
     var body: some View {
@@ -48,41 +51,112 @@ struct V3UnifiedTabs: View {
                     LCUtils.appGroupUserDefault.removeObject(forKey: "LCLaunchExtensionFileBookmark")
                 } else { dispatchURL(url) }
             }
+            // Orphan pruning needs a SideStore ownership query and can wait for
+            // a cold service start. Launch it only after first status and any
+            // incoming install/setup route have been admitted.
+            await status.cleanupOrphanedStagedIPAs()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             status.reload(manual: false)
             routePendingSetup()
         }
-        .onReceive(monitor) { _ in status.reload(manual: false) }
-        .onOpenURL(perform: dispatchURL)
-        .sheet(isPresented: $status.installPickerPresented, onDismiss: {
-            if let url = selectedInstallURL {
-                selectedInstallURL = nil
-                status.stageSharedIPA(url, title: "Install / Sideload App")
-            }
-        }) {
-            V3IPADocumentPicker { url in
-                selectedInstallURL = url
-                status.installPickerPresented = false
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("V3CanonicalJITLessCertificateUpdated"))) { _ in
+            // V3_AWAITABLE_RELOAD_V1: a certificate import just changed
+            // authoritative state. The snapshot is awaited before Setup is
+            // reopened, so the assistant never recomputes JIT-Less from the
+            // pre-import snapshot.
+            Task {
+                await status.reloadAndWait()
+                if status.returnToSetupAfterJITLess {
+                    status.returnToSetupAfterJITLess = false
+                    status.setupPresented = true
+                }
             }
         }
-        .fullScreenCover(item: $status.presentation) { V3OperationSheet(request: $0).environmentObject(status) }
-        .sheet(isPresented: $status.signInPresented, onDismiss: { status.reload() }) {
+        .onReceive(monitor) { _ in status.reload(manual: false) }
+        .onOpenURL(perform: dispatchURL)
+        // V3_USER_FACING_ISSUE_V1: a source failure routes the user to Sources.
+        // Without this the flag was written but never read, so the action would
+        // have appeared to do nothing.
+        .onChange(of: status.sourcesPresented) { presented in
+            guard presented else { return }
+            status.sourcesPresented = false
+            sharedModel.selectedTab = .sources
+        }
+        .overlay(alignment: .topLeading) {
+            V3InstallPickerPresenter(status: status)
+                .frame(width: 1, height: 1)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
+        .fullScreenCover(item: $status.presentation, onDismiss: {
+            status.operationCoverDidDismiss()
+            operationSheetDidDismiss()
+        }) { request in
+            V3OperationSheet(request: request).environmentObject(status)
+        }
+        .sheet(isPresented: $status.signInPresented, onDismiss: {
+            status.reload()
+            routePendingCanonicalJITLessSetup()
+        }) {
             NavigationView { V3SignInView().environmentObject(status) }
                 .navigationViewStyle(StackNavigationViewStyle())
         }
-        .sheet(isPresented: $status.setupPresented) {
+        .sheet(isPresented: $status.setupPresented, onDismiss: { routePendingCanonicalJITLessSetup() }) {
             NavigationView { V3SetupAssistantView().environmentObject(status) }
                 .navigationViewStyle(StackNavigationViewStyle())
         }
-        .alert("SideStore", isPresented: Binding(get: { status.error != nil }, set: { if !$0 { status.error = nil } })) {
-            Button("Copy Diagnostics") { UIPasteboard.general.string = status.error }
-            Button("Retry Connection") { status.reload() }
-            Button("OK", role: .cancel) { status.error = nil }
-        } message: { Text(status.error ?? "") }
+        .sheet(isPresented: $status.connectionPresented) {
+            NavigationView { V3ConnectionView().environmentObject(status) }
+                .navigationViewStyle(StackNavigationViewStyle())
+        }
+        .sheet(isPresented: $status.certificatesPresented) {
+            NavigationView { V3CertificatesView().environmentObject(status) }
+                .navigationViewStyle(StackNavigationViewStyle())
+        }
+        .sheet(isPresented: $status.pairingPresented) {
+            NavigationView { V3PairingView().environmentObject(status) }
+                .navigationViewStyle(StackNavigationViewStyle())
+        }
+        .alert(status.issue?.title ?? "SideStore",
+              isPresented: Binding(get: { status.error != nil },
+                                   set: { if !$0 { status.clearIssue() } })) {
+            // V3_USER_FACING_ISSUE_V1: the primary action is the one the typed
+            // evidence supports. Connection failures open Connection Settings,
+            // and "Retry Source" re-requests sources rather than reloading status.
+            //
+            // A plain message with no structured issue has no action to offer.
+            // It used to render a button labelled "OK" that then did nothing,
+            // alongside a second "OK" that dismissed, so a refusal to work
+            // looked like a choice.
+                if let action = status.issue?.primaryAction, action != .dismiss {
+                Button(action.title) {
+                    status.performPrimaryIssueAction()
+                    status.clearIssue()
+                }
+            }
+            if status.hasUncertainInstallCancellation {
+                Button("Retry Cancellation") { status.retryInstallCancellation() }
+            }
+            Button("Copy Diagnostics") {
+                UIPasteboard.general.string = status.issue?.technicalDetails ?? status.error
+            }
+            Button("OK", role: .cancel) { status.clearIssue() }
+        } message: {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(status.issue?.whatHappened ?? status.error ?? "")
+                if let whatToDo = status.issue?.whatToDo, !whatToDo.isEmpty {
+                    Text("What you can do").font(.caption.weight(.semibold))
+                    Text(whatToDo).font(.caption)
+                }
+            }
+        }
+        .alert("SideStore", isPresented: Binding(get: { status.notice != nil }, set: { if !$0 { status.notice = nil } })) {
+            Button("OK", role: .cancel) { status.notice = nil }
+        } message: { Text(status.notice ?? "") }
         .alert("Stay Informed About Refreshes", isPresented: $showNotificationsPrompt) {
             Button("Allow Notifications") {
-                Task { await LiveContainerAutoRefreshScheduler.requestNotificationPermission() }
+                Task { await LiveContainerAutoRefreshScheduler.requestNotificationPermissionFromUserAction() }
             }
             Button("Later", role: .cancel) {}
         } message: {
@@ -94,6 +168,25 @@ struct V3UnifiedTabs: View {
         LCUtils.appGroupUserDefault.removeObject(forKey: "V3PendingSetupAssistant")
         NSLog("[V3_SETUP] OPEN source=shortcut")
         status.setupPresented = true
+    }
+    private func routePendingCanonicalJITLessSetup() {
+        guard status.pendingCanonicalJITLessSetup else { return }
+        status.pendingCanonicalJITLessSetup = false
+        sharedModel.selectedTab = .settings
+        sharedModel.deepLink = URL(string: "livecontainer://jitless-setup")
+    }
+    private func operationSheetDidDismiss() {
+        guard let destination = status.operationRecoveryDestination else { return }
+        status.operationRecoveryDestination = nil
+        switch destination {
+        case "signIn": status.signInPresented = true
+        case "certificates": status.certificatesPresented = true
+        case "ipa": status.beginInstallPicker()
+        case "sources": sharedModel.selectedTab = .sources
+        case "setup": status.setupPresented = true
+        case "connection": status.connectionPresented = true
+        default: break
+        }
     }
     private func dispatchURL(_ url: URL) {
         if ["https", "http"].contains(url.scheme?.lowercased() ?? "") {
@@ -117,8 +210,11 @@ struct V3UnifiedTabs: View {
         if url.scheme?.lowercased() == "sidestore", url.host?.lowercased() == "appbackupresponse" {
             let result = url.path.lowercased() == "/success" ? "success" : "failure"
             Task {
-                do { _ = try await V3ServiceBridge.shared.request(operation: "backupResult", target: result) }
-                catch { status.error = error.localizedDescription }
+                do {
+                    _ = try await V3ServiceBridge.shared.request(operation: "backupResult", target: result)
+                    status.reload()
+                }
+                catch { status.present(error) }
             }
             return
         }
@@ -137,7 +233,7 @@ struct V3UnifiedTabs: View {
                         $0.bundleID == bundle || ($0.isHost && bundle == Bundle.main.bundleIdentifier)
                     }) else { status.error = "This app is not in SideStore's library."; return }
                     status.perform("jit", target: app.identifier, title: "Enable JIT for " + app.name)
-                } catch { status.error = error.localizedDescription }
+                } catch { status.present(error) }
             }
             return
         }
@@ -164,28 +260,225 @@ struct V3UnifiedTabs: View {
     }
 }
 
-struct V3IPADocumentPicker: UIViewControllerRepresentable {
-    let completion: (URL?) -> Void
-    func makeCoordinator() -> Coordinator { Coordinator(completion: completion) }
-    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.data], asCopy: true)
-        picker.allowsMultipleSelection = false
-        picker.delegate = context.coordinator
-        return picker
+@MainActor
+final class V3InstallPickerAnchorController: UIViewController {
+    var onDidAppear: (() -> Void)?
+
+    override func loadView() {
+        let anchorView = UIView(frame: .zero)
+        anchorView.backgroundColor = .clear
+        anchorView.isUserInteractionEnabled = false
+        view = anchorView
     }
-    func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
-    final class Coordinator: NSObject, UIDocumentPickerDelegate {
-        private var completion: ((URL?) -> Void)?
-        init(completion: @escaping (URL?) -> Void) { self.completion = completion }
-        private func finish(_ url: URL?) {
-            let callback = completion
-            completion = nil
-            callback?(url)
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        onDidAppear?()
+    }
+}
+
+// The initial tap presents UIDocumentPickerViewController directly from a
+// root-attached UIKit controller. The operation cover is requested only after
+// UIKit reports that this picker has actually left the presentation stack.
+struct V3InstallPickerPresenter: UIViewControllerRepresentable {
+    @ObservedObject var status: V3SideStoreStatusStore
+
+    func makeCoordinator() -> Coordinator { Coordinator(status: status) }
+
+    func makeUIViewController(context: Context) -> V3InstallPickerAnchorController {
+        let controller = V3InstallPickerAnchorController()
+        context.coordinator.attach(controller)
+        return controller
+    }
+
+    func updateUIViewController(_ controller: V3InstallPickerAnchorController, context: Context) {
+        context.coordinator.update(status: status)
+    }
+
+    static func dismantleUIViewController(_ controller: V3InstallPickerAnchorController,
+                                           coordinator: Coordinator) {
+        coordinator.detach()
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, UIDocumentPickerDelegate, UIAdaptivePresentationControllerDelegate {
+        private weak var anchor: V3InstallPickerAnchorController?
+        private weak var status: V3SideStoreStatusStore?
+        private let presentation = V3InstallPickerPresentationCoordinator()
+        private var picker: UIDocumentPickerViewController?
+        private var selectionStaged = false
+        private var isDetaching = false
+
+        init(status: V3SideStoreStatusStore) { self.status = status }
+
+        func attach(_ controller: V3InstallPickerAnchorController) {
+            anchor = controller
+            controller.onDidAppear = { [weak self] in self?.anchorDidAppear() }
+            if let status { update(status: status) }
         }
-        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            finish(urls.first)
+
+        func update(status: V3SideStoreStatusStore) {
+            self.status = status
+            guard let attemptID = status.installAttempt.attemptID,
+                  status.installAttempt.phase == .pickerPresented,
+                  presentation.phase == .idle else { return }
+            let ready = anchor?.viewIfLoaded?.window != nil
+            let decision = presentation.request(attemptID: attemptID,
+                presenterReady: ready, presenterBusy: hasPresentedController())
+            handle(decision)
         }
-        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { finish(nil) }
+
+        func detach() {
+            guard let attemptID = presentation.attemptID else { return }
+            isDetaching = true
+            if let picker, picker.presentingViewController != nil {
+                dismissPicker(picker, attemptID: attemptID)
+            } else {
+                status?.cancelInstallPicker(attemptID: attemptID)
+                _ = presentation.fail(attemptID: attemptID)
+            }
+            if presentation.phase == .idle {
+                anchor?.onDidAppear = nil
+                anchor = nil
+                picker = nil
+            }
+        }
+
+        private func anchorDidAppear() {
+            if presentation.phase == .dismissing || presentation.phase == .awaitingDismissal,
+               let attemptID = presentation.attemptID {
+                completeDismissal(attemptID: attemptID)
+                return
+            }
+            handle(presentation.presenterBecameReady(isBusy: hasPresentedController()))
+        }
+
+        private func handle(_ decision: V3InstallPickerPresentationCoordinator.Decision) {
+            switch decision {
+            case .present(let attemptID): presentPicker(attemptID: attemptID)
+            case .rejected(let attemptID, let reason):
+                _ = presentation.fail(attemptID: attemptID)
+                status?.installPickerPresentationFailed(attemptID: attemptID, reason: reason)
+            case .dismissed(let attemptID): finishDismissal(attemptID: attemptID)
+            case .queued, .none: break
+            }
+        }
+
+        private func presentPicker(attemptID: UUID) {
+            guard let anchor, anchor.viewIfLoaded?.window != nil,
+                  !hasPresentedController() else {
+                _ = presentation.fail(attemptID: attemptID)
+                status?.installPickerPresentationFailed(attemptID: attemptID,
+                    reason: self.anchor == nil ? "presenter_unavailable" :
+                        (self.anchor?.viewIfLoaded?.window == nil ? "presenter_not_in_window" : "presentation_active"))
+                return
+            }
+            let documentPicker = UIDocumentPickerViewController(forOpeningContentTypes: [.data], asCopy: true)
+            documentPicker.allowsMultipleSelection = false
+            documentPicker.modalPresentationStyle = .formSheet
+            documentPicker.delegate = self
+            documentPicker.presentationController?.delegate = self
+            picker = documentPicker
+            selectionStaged = false
+            status?.installPickerPresentationRequested(attemptID: attemptID)
+            anchor.present(documentPicker, animated: true) { [weak self, weak documentPicker] in
+                guard let self, let documentPicker else { return }
+                guard self.presentation.didPresent(attemptID: attemptID) else {
+                    guard self.presentation.attemptID == attemptID else { return }
+                    if self.presentation.phase == .dismissing || self.presentation.phase == .awaitingDismissal {
+                        documentPicker.presentationController?.delegate = self
+                        self.completeDismissal(attemptID: attemptID)
+                        return
+                    }
+                    self.presentation.fail(attemptID: attemptID)
+                    self.status?.installPickerPresentationFailed(
+                        attemptID: attemptID, reason: "presentation_interrupted")
+                    return
+                }
+                guard self.anchor?.presentedViewController === documentPicker else {
+                    self.presentation.fail(attemptID: attemptID)
+                    self.status?.installPickerPresentationFailed(
+                        attemptID: attemptID, reason: "presentation_interrupted")
+                    return
+                }
+                documentPicker.presentationController?.delegate = self
+                self.status?.installPickerDidPresent(attemptID: attemptID)
+            }
+        }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController,
+                            didPickDocumentsAt urls: [URL]) {
+            guard let attemptID = presentation.attemptID,
+                  presentation.phase == .presented,
+                  let url = urls.first else { return }
+            selectionStaged = status?.stagePickerIPA(url, attemptID: attemptID) != nil
+            dismissPicker(controller, attemptID: attemptID)
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            guard let attemptID = presentation.attemptID else { return }
+            selectionStaged = false
+            dismissPicker(controller, attemptID: attemptID)
+        }
+
+        func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+            guard let attemptID = presentation.attemptID else { return }
+            if presentation.phase == .presented || presentation.phase == .presenting {
+                _ = presentation.beginDismissal(attemptID: attemptID)
+            }
+            completeDismissal(attemptID: attemptID)
+        }
+
+        private func dismissPicker(_ controller: UIDocumentPickerViewController, attemptID: UUID) {
+            guard presentation.beginDismissal(attemptID: attemptID) else { return }
+            if controller.isBeingDismissed {
+                controller.transitionCoordinator?.animate(alongsideTransition: nil) { [weak self] _ in
+                    self?.completeDismissal(attemptID: attemptID)
+                }
+                completeDismissal(attemptID: attemptID)
+            } else if controller.presentingViewController == nil {
+                completeDismissal(attemptID: attemptID)
+            } else {
+                controller.dismiss(animated: true) { [weak self] in
+                    self?.completeDismissal(attemptID: attemptID)
+                }
+            }
+        }
+
+        private func completeDismissal(attemptID: UUID) {
+            guard presentation.attemptID == attemptID else { return }
+            let dismissed = presentation.didDismiss(attemptID: attemptID,
+                presenterIsClear: !hasPresentedController())
+            guard dismissed else {
+                NSLog("[V3_INSTALL_UI] picker_dismiss_wait attempt=%@", attemptID.uuidString)
+                return
+            }
+            finishDismissal(attemptID: attemptID)
+        }
+
+        private func finishDismissal(attemptID: UUID) {
+            let selected = selectionStaged
+            picker = nil
+            selectionStaged = false
+            NSLog("[V3_INSTALL_UI] picker_dismissed attempt=%@ selected=%d",
+                  attemptID.uuidString, selected ? 1 : 0)
+            if isDetaching {
+                status?.cancelInstallPicker(attemptID: attemptID)
+            } else if selected {
+                status?.installPickerDidDisappear(attemptID: attemptID)
+            } else {
+                status?.cancelInstallPicker(attemptID: attemptID)
+            }
+        }
+
+        private func hasPresentedController() -> Bool {
+            var current: UIViewController? = anchor
+            while let controller = current {
+                if controller.presentedViewController != nil { return true }
+                current = controller.parent
+            }
+            return false
+        }
     }
 }
 
@@ -193,36 +486,281 @@ struct V3RefreshAllButton: View {
     @EnvironmentObject private var status: V3SideStoreStatusStore
     @AppStorage("liveContainerAutoRefreshActiveRunID", store: UserDefaults(suiteName: "group.com.SideStore.SideStore")) private var activeRun = ""
     @AppStorage("liveContainerAutoRefreshHealthState", store: UserDefaults(suiteName: "group.com.SideStore.SideStore")) private var health = "UNKNOWN"
+    @State private var attempt = V3RefreshAllAttemptState()
+    @State private var message = ""
+    @State private var diagnostics = ""
+    @State private var terminalFailure: V3OperationFailureDetails?
+    @State private var copied = false
+    @State private var monitor: Task<Void, Never>?
+    private let defaults = UserDefaults(suiteName: "group.com.SideStore.SideStore")
+
+    private var phase: String { attempt.phase.rawValue }
+    private var requestID: String { attempt.requestID }
+    private var runID: String { attempt.runID }
+
     var body: some View {
-        Button {
-            NotificationCenter.default.post(name: Notification.Name("LiveContainerAutoRefreshRunNow"), object: nil)
-        } label: {
-            HStack {
-                if !activeRun.isEmpty { ProgressView() }
-                Text("Refresh All")
+        VStack(alignment: .leading, spacing: 8) {
+            Button(action: start) {
+                HStack(spacing: 8) {
+                    if ["starting", "refreshing", "verifying"].contains(phase) { ProgressView() }
+                    Text(buttonTitle)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+            }
+            .disabled(isBusy || isTerminal || !activeRun.isEmpty || status.presentation != nil || status.loading)
+            .accessibilityValue(health.replacingOccurrences(of: "_", with: " ").lowercased())
+            if V3RefreshAllButtonPresentationPolicy.explainsConcurrentRun(
+                phase: attempt.phase, activeRunID: activeRun) {
+                Text("Another refresh is already running. Refresh All will be available when it finishes.")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+            }
+            if phase == "completed" || phase == "failed" {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("What happened").font(.caption.weight(.semibold))
+                    Text(message)
+                        .font(.footnote)
+                        .foregroundColor(phase == "completed" ? .green : .red)
+                        .textSelection(.enabled)
+                    if phase == "failed", let terminalFailure {
+                        Text("What you can do").font(.caption.weight(.semibold)).padding(.top, 4)
+                        Text(terminalFailure.recommendedAction).font(.footnote)
+                        HStack {
+                            if let destination = terminalFailure.recoveryDestination,
+                               let action = terminalFailure.recoveryActionTitle {
+                                Button(action) { openFailureRecovery(destination) }
+                            }
+                            if [.allowed, .unknown].contains(terminalFailure.retryDisposition) {
+                                Button(terminalFailure.retryDisposition == .unknown
+                                    ? "Retry (retryability unknown)" : "Retry") {
+                                        retryFailedAttempt()
+                                    }
+                                    .disabled(!activeRun.isEmpty || status.presentation != nil || status.loading)
+                            }
+                        }
+                    } else if phase == "failed", message == "Refresh did not start." {
+                        Button("Start Again") { acknowledge(); start() }
+                            .disabled(!activeRun.isEmpty || status.presentation != nil || status.loading)
+                    }
+                }
+                HStack {
+                    Button(copied ? "Copied" : "Copy Diagnostics") {
+                        UIPasteboard.general.string = diagnostics
+                        copied = true
+                    }
+                    .font(.caption)
+                    Button("Dismiss") { acknowledge() }
+                        .font(.caption)
+                    Spacer(minLength: 0)
+                }
             }
         }
-        .disabled(!activeRun.isEmpty || status.presentation != nil)
-        .accessibilityValue(health.replacingOccurrences(of: "_", with: " ").lowercased())
-        .onChange(of: health) { _ in status.reload(manual: false) }
-        .onChange(of: activeRun) { value in if value.isEmpty { status.reload(manual: false) } }
+        .onChange(of: health) { _ in
+            status.reload(manual: false)
+            if phase == "refreshing" || phase == "verifying" { inspectSchedulerState() }
+        }
+        .onChange(of: activeRun) { _ in
+            if phase == "starting" || phase == "refreshing" || phase == "verifying" {
+                inspectSchedulerState()
+            }
+            if activeRun.isEmpty { status.reload(manual: false) }
+        }
+        .accessibilityHint("Starts one manual refresh and shows scheduler state through verified completion or failure.")
+    }
+    private var isBusy: Bool { ["starting", "refreshing", "verifying"].contains(phase) }
+    private var isTerminal: Bool { ["completed", "failed"].contains(phase) }
+    private var buttonTitle: String {
+        V3RefreshAllButtonPresentationPolicy.title(phase: attempt.phase, activeRunID: activeRun)
+    }
+
+    private func start() {
+        guard attempt.phase == .idle, !isBusy, !isTerminal, activeRun.isEmpty,
+              status.presentation == nil, !status.loading else { return }
+        let newRequestID = UUID().uuidString
+        attempt.begin(requestID: newRequestID)
+        message = "Starting Refresh..."
+        diagnostics = "manual_refresh_request=\(newRequestID)\nstate=starting"
+        // V3_REFRESH_PREREQUISITE_POLICY_V1: shared policy, evaluated before the
+        // mutation request is posted. A known-missing pairing file blocks here
+        // instead of surfacing later as an unexplained refresh failure.
+        if let failure = V3RefreshPrerequisite.evaluate(pairingStatus: status.pairing)
+            .failure(correlationID: newRequestID) {
+            attempt.failBeforeStart(message: failure.safeMessage)
+            terminalFailure = V3OperationFailureDetails(failure)
+            message = failure.safeMessage
+            diagnostics = "schema=1\nrequest_id=\(newRequestID)\nrun_id=not_started\nstate=failed\n\(failure.technicalDetails)\nsafe_message=\(failure.safeMessage)"
+            return
+        }
+        print("[V3_HOME_REFRESH] REQUEST request_id=\(newRequestID) origin=home health=\(health) active_run_id=\(activeRun.isEmpty ? "none" : activeRun)")
+        NotificationCenter.default.post(name: Notification.Name("LiveContainerAutoRefreshRunNow"), object: nil,
+                                        userInfo: ["requestID": newRequestID, "origin": "home"])
+        monitor = Task { @MainActor in await monitorRun(requestID: newRequestID) }
+    }
+
+    private func monitorRun(requestID expectedRequest: String) async {
+        let startDeadline = Date().addingTimeInterval(20)
+        while !Task.isCancelled && Date() < startDeadline {
+            if let record = runRecord(requestID: expectedRequest) {
+                _ = attempt.observe(record, schedulerHealth: health, activeRunID: activeRun)
+                renderAttempt(record)
+                if attempt.isTerminal { return }
+                if !attempt.runID.isEmpty { break }
+            }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        guard !Task.isCancelled else { return }
+        if attempt.runID.isEmpty {
+            attempt.markDidNotStart()
+            renderFailure(health: health)
+            return
+        }
+
+        let finishDeadline = Date().addingTimeInterval(600)
+        while !Task.isCancelled && Date() < finishDeadline {
+            inspectSchedulerState()
+            if attempt.isTerminal { return }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        if !Task.isCancelled && !attempt.isTerminal {
+            attempt.markTimedOut()
+            renderFailure(health: health)
+        }
+    }
+
+    private func inspectSchedulerState() {
+        guard !attempt.isTerminal, !runID.isEmpty,
+              let record = runRecord(requestID: requestID, runID: runID) else { return }
+        _ = attempt.observe(record, schedulerHealth: health, activeRunID: activeRun)
+        renderAttempt(record)
+    }
+
+    private func runRecord(requestID: String, runID: String? = nil) -> [String: Any]? {
+        guard let defaults,
+              let ledger = defaults.dictionary(forKey: "liveContainerAutoRefreshRunLedger") else { return nil }
+        return V3RefreshAllAttemptState.record(in: ledger, requestID: requestID, runID: runID)
+    }
+
+    private func renderAttempt(_ record: [String: Any]) {
+        switch attempt.phase {
+        case .starting:
+            message = "Starting Refresh..."
+        case .refreshing:
+            message = "Refreshing..."
+        case .verifying:
+            message = "Verifying..."
+        case .completed:
+            let manifest = record["manifest"] as? [String: Any]
+                ?? record["manifest_summary"] as? [String: Any] ?? [:]
+            let verifiedCount = (manifest["results"] as? [[String: Any]])?.count ??
+                V3RefreshAllTerminalEvidencePolicy.count("result_count", in: manifest) ?? 0
+            let skippedCount = (manifest["skipped_ids"] as? [String])?.count ??
+                V3RefreshAllTerminalEvidencePolicy.count("skipped_count", in: manifest) ?? 0
+            message = attempt.terminalMessage
+            terminalFailure = nil
+            diagnostics = "manual_refresh_request=\(requestID)\nrun_id=\(runID)\nstate=completed\nverified_app_count=\(verifiedCount)\nskipped_app_count=\(skippedCount)"
+        case .failed:
+            renderFailure(health: record["health"] as? String ?? health, record: record)
+        case .idle:
+            break
+        }
+    }
+
+    private func renderFailure(health: String, record: [String: Any]? = nil) {
+        guard !isTerminal || phase == "failed" else { return }
+        message = attempt.terminalMessage.isEmpty ? "Refresh failed. Check Refresh History for details." : attempt.terminalMessage
+        terminalFailure = record.flatMap { value in
+            guard let wire = value["failure"] as? [String: Any],
+                  let failure = CombinedFailure.decode(wire, expectedID: runID),
+                  failure.operation == "refresh" else { return nil }
+            return V3OperationFailureDetails(failure)
+        }
+        if let record, !runID.isEmpty,
+           let currentRunDiagnostics = V3RefreshAllFailureDiagnostics.text(
+               requestID: requestID, runID: runID, record: record) {
+            diagnostics = currentRunDiagnostics
+        } else {
+            diagnostics = [
+                "schema=1",
+                "request_id=\(requestID)",
+                "manual_refresh_request=\(requestID)",
+                "run_id=\(runID.isEmpty ? "not_started" : runID)",
+                "state=failed",
+                "operation=refresh",
+                "stage=refreshVerification",
+                "code=unknown",
+                "source_step=unknown",
+                "correlation=\(runID.isEmpty ? "unknown" : runID)",
+                "underlying_domain=redacted",
+                "underlying_code=unknown",
+                "retryable=unknown",
+                "safe_cause=unknown",
+                "origin=unknown",
+                "network_preflight=unknown",
+                "safe_message=\(message)",
+                "health=\(health)"
+            ].joined(separator: "\n")
+        }
+    }
+
+    private func acknowledge() {
+        monitor?.cancel()
+        monitor = nil
+        attempt.acknowledge()
+        message = ""
+        diagnostics = ""
+        terminalFailure = nil
+        copied = false
+    }
+
+    private func retryFailedAttempt() {
+        guard phase == "failed", let terminalFailure,
+              [.allowed, .unknown].contains(terminalFailure.retryDisposition),
+              activeRun.isEmpty, status.presentation == nil, !status.loading else { return }
+        acknowledge()
+        start()
+    }
+
+    private func openFailureRecovery(_ destination: String) {
+        switch destination {
+        case "signIn": status.signInPresented = true
+        case "certificates": status.certificatesPresented = true
+        case "ipa": status.beginInstallPicker()
+        case "setup": status.setupPresented = true
+        case "connection": status.connectionPresented = true
+        case "pairing": status.pairingPresented = true
+        default: break
+        }
     }
 }
 
 struct V3InstallButton: View {
     @EnvironmentObject private var status: V3SideStoreStatusStore
     var body: some View {
-        Button("Install / Sideload App") { status.installPickerPresented = true }
-            .accessibilityHint("Choose an IPA to sign and install as an iOS app with SideStore")
-            .disabled(status.presentation != nil || status.installPickerPresented)
+        Button("Install with SideStore", systemImage: "arrow.down.app") {
+            status.beginInstallPicker()
+        }
+        .accessibilityLabel("Install / Sideload App with SideStore")
+        .accessibilityHint("Choose an IPA to sign and install as an iOS app.")
     }
 }
 
 struct V3OperationRequest: Identifiable {
-    let id = UUID()
+    let id: UUID
     let operation: String
     let target: String
     let title: String
+    let installAttemptID: UUID?
+
+    init(id: UUID = UUID(), operation: String, target: String, title: String,
+         installAttemptID: UUID? = nil) {
+        self.id = id
+        self.operation = operation
+        self.target = target
+        self.title = title
+        self.installAttemptID = installAttemptID
+    }
 }
 
 struct V3PromptAnswer {
@@ -239,33 +777,396 @@ final class V3SideStoreStatusStore: ObservableObject {
     @Published private(set) var certificate = "Unknown"
     @Published private(set) var certificateExpiration: Date?
     @Published private(set) var pairing = "Unknown"
+    // V3_AUTH_SESSION_SNAPSHOT_V1: the service reports the authenticated Apple
+    // session separately from the active account row, because authentication
+    // completes before provisioning activates that row.
+    @Published private(set) var authenticated = false
+    @Published private(set) var provisioningIncomplete = false
+    // V3_SETUP_COMPLETION_POLICY_V1: the last authoritative Wi-Fi observation.
+    // Probing Wi-Fi is async, so Home reads this cache instead of guessing.
+    // nil means "not observed yet", which counts as outstanding. It is written
+    // only through recordWifiAvailability so the cached fact has one owner.
+    @Published private(set) var wifiAvailable: Bool?
+
+    /// Records the authoritative Wi-Fi observation for the shared setup policy.
+    func recordWifiAvailability(_ available: Bool) {
+        wifiAvailable = available
+    }
+
+    // V3_SHARED_JITLESS_FACT_V1: the last authoritative JIT-Less readiness.
+    // Health, the Setup Assistant and the store's own setup-fact observation all
+    // publish it, and Home reads it, so no surface can claim a different
+    // completion answer. nil means "not observed yet" and counts as
+    // outstanding, so a fact nothing observes can never read as satisfied.
+    @Published private(set) var jitlessReadiness: V3JITLessReadiness?
+
+    /// Publishes an observed JIT-Less readiness for every setup surface to share.
+    func recordJITLessReadiness(_ readiness: V3JITLessReadiness) {
+        jitlessReadiness = readiness
+    }
+
+    // V3_SETUP_FACT_OBSERVATION_V1
+    // The two facts above were only ever observed by the Setup Assistant and by
+    // Health. A user who opened neither left them nil, and nil is outstanding by
+    // policy, so on a platform where JIT-Less is required the Home banner could
+    // never clear no matter how correct the underlying state was. The store now
+    // observes them itself, once, after its first authoritative snapshot.
+    //
+    // The attempt is tri-state rather than a boolean so a failure cannot become
+    // an unbounded retry loop against a service that is not answering, and so a
+    // deliberate reload can still ask again.
+    private enum SetupFactObservation: Equatable {
+        /// Not attempted yet.
+        case pending
+        /// Both facts are known.
+        case observed
+        /// Attempted and the service did not answer. Not retried automatically.
+        case deferred
+    }
+    private var setupFactObservation: SetupFactObservation = .pending
+
+    /// Observes the shared setup facts once, when they are the only thing
+    /// standing between the user and a cleared setup banner.
+    private func observeSetupFactsIfNeeded() {
+        guard setupFactObservation == .pending, connected,
+              loadActivity == .idle, presentation == nil else { return }
+        // Where JIT-Less is not required and Wi-Fi is already known, there is
+        // nothing to learn.
+        guard jitlessReadiness == nil || wifiAvailable == nil else {
+            setupFactObservation = .observed
+            return
+        }
+        setupFactObservation = .deferred
+        Task { await observeSetupFacts() }
+    }
+
+    private func observeSetupFacts() async {
+        // Wi-Fi is a host-side fact, so it is probed here rather than asked of
+        // the service. An unavailable answer is recorded as unavailable, not as
+        // unknown, because the probe is the authority for it.
+        let wifi = await LiveContainerNetworkPreflight.wifiAvailable()
+        recordWifiAvailability(wifi)
+        do {
+            let health = try await V3ServiceBridge.shared.request(operation: "healthSnapshot")
+            let certificate = health["certificateState"] as? [String: Any] ?? [:]
+            let readiness = await V3JITLessStatusReader.read(serviceCertificate: certificate)
+            recordJITLessReadiness(readiness.readiness)
+            setupFactObservation = .observed
+        } catch {
+            // Unobserved is published as unknown, so the item stays outstanding
+            // rather than the banner claiming a certificate exists.
+            recordJITLessReadiness(.unknown)
+        }
+    }
     @Published private(set) var updatedAt: Date?
     @Published private(set) var installedApps: [V3SideStoreApp] = []
     @Published private(set) var sources: [V3SideStoreSource] = []
     @Published private(set) var settings: [String: Bool] = [:]
     @Published var error: String?
-    @Published var presentation: V3OperationRequest?
+    // V3_USER_FACING_ISSUE_V1: the structured issue behind the global alert.
+    // The string form is retained for compatibility and copyable summaries, but
+    // actions are chosen from the typed issue, never from the string.
+    @Published private(set) var issue: V3UserFacingIssue?
+    @Published var notice: String?
+
+    /// Presents a failure with the action its typed evidence supports.
+    func present(_ error: Error) {
+        if let combined = error as? CombinedFailure {
+            let structured = V3UserFacingIssue.make(combined)
+            issue = structured
+            self.error = structured.summary
+        } else {
+            // V3_FAILURE_GUIDANCE_V1: an untyped failure still gets guidance, and
+            // still never claims a connection problem without evidence. The raw
+            // description is not shown to the user, because for a bridged NSError
+            // it is a numeric domain and code; it is kept in the diagnostics the
+            // user can copy instead.
+            let structured = V3UserFacingIssue.make(
+                operation: "command", stage: CombinedFailure.Stage.command.rawValue,
+                code: CombinedFailure.Code.failed.rawValue, safeCause: nil, sourceStep: nil,
+                retryable: nil,
+                whatHappened: "That action did not complete.",
+                whatToDo: V3FailureGuidance.message(error),
+                technicalDetails: V3FailureGuidance.diagnostics(error))
+            issue = structured
+            self.error = structured.summary
+        }
+    }
+
+    func clearIssue() {
+        issue = nil
+        error = nil
+    }
+
+    /// Opens the destination an issue's primary action points at.
+    func openIssueRecovery() {
+        guard let destination = issue?.recoveryDestination else { return }
+        switch destination {
+        case "signIn": signInPresented = true
+        case "certificates": certificatesPresented = true
+        case "ipa": beginInstallPicker()
+        case "setup": setupPresented = true
+        case "connection": connectionPresented = true
+        case "pairing": pairingPresented = true
+        case "sources": sourcesPresented = true
+        default: break
+        }
+    }
+
+    /// Runs the primary action the typed evidence selected.
+    ///
+    /// The two retry actions are deliberately different. A connection failure is
+    /// re-observed by reloading status. A source failure must re-request the
+    /// sources themselves, because reloading status does not re-fetch a manifest
+    /// and would leave the user looking at the same empty or stale catalog while
+    /// the button claims it retried.
+    func performPrimaryIssueAction() {
+        guard let action = issue?.primaryAction else { return }
+        switch action {
+        case .retrySource:
+            refreshSources()
+        case .reloadSources:
+            reload()
+        default:
+            openIssueRecovery()
+        }
+    }
+
+    @Published var presentation: V3OperationRequest? {
+        didSet {
+            // A presented operation owns the state a snapshot would report, so a
+            // deferred snapshot is owed until it ends. Draining here is what
+            // guarantees a parked continuation is resumed rather than stranded.
+            if presentation == nil { drainOwedSnapshot() }
+        }
+    }
     @Published var sourceURL = ""
     @Published var refreshTarget: String?
     @Published var refreshPresented = false
-    @Published var installPickerPresented = false
     @Published var signInPresented = false
     @Published var setupPresented = false
+    @Published var pendingCanonicalJITLessSetup = false
+    @Published var returnToSetupAfterJITLess = false
+    @Published var connectionPresented = false
+    @Published var certificatesPresented = false
+    @Published var pairingPresented = false
+    // V3_USER_FACING_ISSUE_V1: a source failure routes back to Sources.
+    @Published var sourcesPresented = false
+    @Published var operationRecoveryDestination: String?
+    // V3_LOAD_ACTIVITY_OWNERSHIP_V1: `loading` keeps its user-facing meaning of
+    // "the service is busy", but it is now derived from a named activity so the
+    // snapshot gate can tell a snapshot from a mutation. Five of the six
+    // activities that used to set this flag were mutations.
     @Published private(set) var loading = false
     @Published private(set) var connected = false
     @Published private(set) var requiresConnectionRetry = false
+    // The activity that currently owns the service. Only `.snapshot` may resolve
+    // a snapshot waiter.
+    private var loadActivity: V3LoadActivity = .idle
+    // At most one snapshot is owed, because at most one can be pending. Starting
+    // any snapshot discharges it, so an unrelated reload can never leave a stale
+    // intent behind to cause a second fetch.
+    private var snapshotOwed = false
+    // Callers awaiting an authoritative snapshot. Each carries whether it needs
+    // a manual snapshot, because the owed drain is shared and a non-manual
+    // monitor tick must not discharge a caller's manual requirement.
+    private struct SnapshotWaiter {
+        let manual: Bool
+        let continuation: CheckedContinuation<V3ReloadOutcome, Never>
+    }
+    private var snapshotWaiters: [SnapshotWaiter] = []
+    private var pendingPickerError: (attemptID: UUID, message: String)?
+    @Published private(set) var installAttempt = V3InstallAttemptState()
     var installedAppCount: Int { installedApps.count }
+    var hasUncertainInstallCancellation: Bool {
+        installAttempt.backendSessionID != nil &&
+            (installAttempt.phase == .operationStarted || installAttempt.phase == .operationPresented)
+    }
     var isStale: Bool { !connected || (updatedAt.map { Date().timeIntervalSince($0) > 120 } ?? true) }
-    var needsSignIn: Bool { account == "Not signed in" }
+    var needsSignIn: Bool { V3AuthSnapshotAuthorityPolicy.needsSignIn(authenticated: authenticated) }
+    // V3_AWAITABLE_RELOAD_V1 / V3_LOAD_ACTIVITY_OWNERSHIP_V1
+    // reload() is fire-and-forget: it starts the snapshot and continues
+    // immediately, so any code that reads status right after it sees the
+    // PREVIOUS snapshot. reloadAndWait() completes only after an authoritative
+    // snapshot has been applied, which is what callers that depend on ordering
+    // must use. No delay or sleep is involved: the caller awaits the real
+    // snapshot.
     func reload(manual: Bool = true) {
-        guard !loading, presentation == nil, manual || !requiresConnectionRetry else { return }
-        if manual { requiresConnectionRetry = false }
+        switch beginSnapshot(manual: manual) {
+        case .performSnapshot:
+            Task { _ = await performSnapshot() }
+        case .joinSnapshot, .awaitMutationThenSnapshot, .deferForPresentation:
+            // The request is remembered and satisfied by the drain once the
+            // blocking activity ends. No continuation is parked, because this
+            // caller does not wait.
+            break
+        case .doNotObserve:
+            break
+        }
+    }
+
+    /// The result of awaiting an authoritative snapshot.
+    ///
+    /// A Bool could not distinguish "the snapshot ran and failed" from "no
+    /// snapshot ran at all", so a caller that recomputes derived state could be
+    /// told it had fresh state when it had been handed the previous snapshot
+    /// unchanged.
+    enum V3ReloadOutcome: Equatable {
+        /// A snapshot was performed and accepted.
+        case applied
+        /// A snapshot was performed and failed.
+        case snapshotFailed
+        /// No snapshot was performed. A caller that recomputes derived state
+        /// must treat this as "unknown", never as "up to date".
+        case notObserved
+    }
+
+    /// Performs one authoritative snapshot and returns only once the resulting
+    /// state has been applied.
+    ///
+    /// If a snapshot is already in flight this joins that one. If a mutation is
+    /// in flight it waits for a snapshot performed after that mutation, because
+    /// a mutation's completion says nothing about authoritative status. If a
+    /// presented operation owns the state it waits for the deferred snapshot. In
+    /// every parked case only a snapshot completion resumes the caller.
+    @discardableResult
+    func reloadAndWait(manual: Bool = true) async -> V3ReloadOutcome {
+        switch beginSnapshot(manual: manual) {
+        case .performSnapshot:
+            return await performSnapshot()
+        case .joinSnapshot, .awaitMutationThenSnapshot, .deferForPresentation:
+            // Parked. There is no suspension between the gate decision and this
+            // append, so a snapshot finishing in between cannot be missed and a
+            // continuation cannot be left stranded.
+            return await withCheckedContinuation { continuation in
+                snapshotWaiters.append(SnapshotWaiter(manual: manual, continuation: continuation))
+            }
+        case .doNotObserve:
+            // Nothing ran and nothing is owed, so no continuation is parked.
+            return .notObserved
+        }
+    }
+
+    /// The shared synchronous gate. It names the activity instead of inferring
+    /// one from a shared busy flag, and it is the only place a snapshot is
+    /// started or a waiter is parked.
+    private func beginSnapshot(manual: Bool) -> V3SnapshotDecision {
+        let decision = V3SnapshotGate.decide(
+            activity: loadActivity, presentationActive: presentation != nil,
+            manual: manual, requiresConnectionRetry: requiresConnectionRetry)
+        switch decision {
+        case .performSnapshot:
+            startSnapshot(manual: manual)
+        case .joinSnapshot:
+            break
+        case .awaitMutationThenSnapshot, .deferForPresentation:
+            // A snapshot is owed. It is owed once, not once per requester, so a
+            // burst of requests cannot queue a burst of fetches.
+            snapshotOwed = true
+        case .doNotObserve:
+            break
+        }
+        return decision
+    }
+
+    /// Claims the service for a snapshot. Starting any snapshot discharges the
+    /// owed intent, which is what stops an unrelated reload from leaving a stale
+    /// request behind to cause a second fetch.
+    private func startSnapshot(manual: Bool) {
+        snapshotOwed = false
+        if manual {
+            requiresConnectionRetry = false
+            // A deliberate reload is also a deliberate request to try the
+            // shared setup facts again, so a previous service failure is not
+            // permanent.
+            if setupFactObservation == .deferred { setupFactObservation = .pending }
+        }
+        loadActivity = .snapshot
         loading = true
-        Task {
-            defer { loading = false }
-            do {
-                accept(try await V3ServiceBridge.shared.request(operation: "snapshot"))
-            } catch { connected = false; requiresConnectionRetry = true; self.error = error.localizedDescription }
+        if installAttempt.hasActiveAttempt {
+            NSLog("[V3_INSTALL_STATE] attempt=%@ event=snapshot_started phase=%@",
+                  installAttempt.attemptID?.uuidString ?? "none", installAttempt.phase.rawValue)
+        }
+    }
+
+    /// Claims the service for a mutation. A mutation never resolves a snapshot
+    /// waiter; it only makes an owed snapshot due.
+    private func beginMutation() {
+        loadActivity = .mutation
+        loading = true
+    }
+
+    private func performSnapshot() async -> V3ReloadOutcome {
+        var succeeded = false
+        do {
+            accept(try await V3ServiceBridge.shared.request(operation: "snapshot"))
+            succeeded = true
+        } catch {
+            connected = false
+            requiresConnectionRetry = true
+            present(error)
+        }
+        let outcome: V3ReloadOutcome = succeeded ? .applied : .snapshotFailed
+        // The only place a snapshot waiter is ever resumed. State is fully
+        // applied first, so no caller can observe a partially updated snapshot.
+        finishSnapshot(outcome: outcome)
+        if installAttempt.hasActiveAttempt {
+            NSLog("[V3_INSTALL_STATE] attempt=%@ event=snapshot_finished phase=%@",
+                  installAttempt.attemptID?.uuidString ?? "none", installAttempt.phase.rawValue)
+        }
+        drainInstallPresentation(trigger: "snapshot_finished")
+        // V3_SETUP_FACT_OBSERVATION_V1: only once an authoritative snapshot has
+        // landed, so the observation is never made against a disconnected store.
+        observeSetupFactsIfNeeded()
+        return outcome
+    }
+
+    /// V3_AWAITABLE_RELOAD_V1: the single place a snapshot activity ends.
+    private func finishSnapshot(outcome: V3ReloadOutcome) {
+        loadActivity = .idle
+        loading = false
+        // The install presentation gate is snapshot-scoped: it advances only once
+        // authoritative state has landed. A mutation advancing it would claim a
+        // snapshot had happened.
+        installAttempt.reloadFinished()
+        let waiting = snapshotWaiters
+        snapshotWaiters.removeAll()
+        for waiter in waiting { waiter.continuation.resume(returning: outcome) }
+        drainOwedSnapshot()
+    }
+
+    /// V3_LOAD_ACTIVITY_OWNERSHIP_V1: the single place a mutation activity ends.
+    /// It resolves nothing. A caller awaiting authoritative status stays parked
+    /// until a real snapshot completes, because a mutation's reply says nothing
+    /// about the state a snapshot reports.
+    private func finishMutation() {
+        loadActivity = .idle
+        loading = false
+        drainOwedSnapshot()
+    }
+
+    /// Runs the single owed snapshot once nothing blocks it.
+    ///
+    /// The decision is total. If policy refuses the snapshot, every parked
+    /// continuation is resumed with `.notObserved` rather than left suspended,
+    /// which is what let a non-manual deferred reload hang a task forever.
+    private func drainOwedSnapshot() {
+        let needsManual = snapshotWaiters.contains { $0.manual }
+        switch V3SnapshotGate.drain(activity: loadActivity, presentationActive: presentation != nil,
+                                    owed: snapshotOwed, anyWaiterNeedsManual: needsManual,
+                                    requiresConnectionRetry: requiresConnectionRetry) {
+        case .performSnapshot:
+            startSnapshot(manual: needsManual || !requiresConnectionRetry)
+            Task { _ = await performSnapshot() }
+        case .joinSnapshot, .awaitMutationThenSnapshot, .deferForPresentation:
+            // Still blocked. The owed intent is kept for whoever ends it.
+            break
+        case .doNotObserve:
+            guard snapshotOwed else { return }
+            snapshotOwed = false
+            let waiting = snapshotWaiters
+            snapshotWaiters.removeAll()
+            for waiter in waiting { waiter.continuation.resume(returning: .notObserved) }
         }
     }
     func accept(_ snapshot: [String: Any]) {
@@ -275,6 +1176,8 @@ final class V3SideStoreStatusStore: ObservableObject {
         certificate = snapshot["certificate"] as? String ?? "Unknown"
         certificateExpiration = (snapshot["certificateExpiration"] as? Date).flatMap { $0 == .distantPast ? nil : $0 }
         pairing = snapshot["pairing"] as? String ?? "Unknown"
+        authenticated = V3ServiceBridge.strictBool(snapshot["authenticated"]) ?? false
+        provisioningIncomplete = V3ServiceBridge.strictBool(snapshot["provisioningIncomplete"]) ?? false
         updatedAt = snapshot["updatedAt"] as? Date
         installedApps = (snapshot["installedApps"] as? [[String: Any]] ?? []).compactMap(V3SideStoreApp.init)
         sources = (snapshot["sources"] as? [[String: Any]] ?? []).compactMap(V3SideStoreSource.init)
@@ -282,7 +1185,17 @@ final class V3SideStoreStatusStore: ObservableObject {
         connected = true
     }
     func perform(_ operation: String, target: String = "", title: String, value: Bool? = nil) {
-        guard presentation == nil else { return }
+        // A second operation while one is presented must explain itself
+        // instead of silently doing nothing (which looks like the first tap
+        // was ignored and invites blind retries).
+        guard presentation == nil, !installAttempt.hasActiveAttempt else {
+            self.error = "Another operation is already running. Finish or cancel it before starting a new one."
+            return
+        }
+        guard loadActivity == .idle else {
+            presentBusy()
+            return
+        }
         switch operation {
         case "signOut": signOut()
         case "syncAppIDs": syncAppIDs()
@@ -291,7 +1204,8 @@ final class V3SideStoreStatusStore: ObservableObject {
         case "jit": jit(target: target)
         case "install", "installURL", "installSharedIPA", "update", "refreshApp",
              "activate", "deactivate", "remove", "delete", "backup", "restore":
-            presentation = V3OperationRequest(operation: operation, target: target, title: title)
+            let request = V3OperationRequest(operation: operation, target: target, title: title)
+            presentation = request
         default: break
         }
     }
@@ -300,57 +1214,49 @@ final class V3SideStoreStatusStore: ObservableObject {
     }
     private func failed(_ error: Error) {
         if needsSignIn(error) { signInPresented = true }
-        else { self.error = error.localizedDescription }
+        else { present(error) }
     }
-    func signOut() {
-        loading = true
+
+    /// V3_LOAD_ACTIVITY_OWNERSHIP_V1: a busy store explains itself.
+    ///
+    /// refreshSources() was reachable from the global alert's "Retry Source"
+    /// action, where a silent guard produced no work, no message, and a
+    /// dismissed alert: the user was told a source retry had happened when
+    /// nothing had been requested. Every entry point now reports the conflict.
+    private func presentBusy() {
+        self.error = "SideStore is still loading. Wait for the current request to finish, then try again."
+    }
+
+    /// Runs one service mutation under an explicit mutation activity.
+    ///
+    /// A mutation owns the service but is not a snapshot, so it must never
+    /// resolve a caller awaiting authoritative status. A snapshot is requested
+    /// after it; a caller already parked is released by that snapshot, not by
+    /// this one. The trailing reload is a plain request, so if the drain already
+    /// started the owed snapshot this joins it instead of fetching twice.
+    private func runMutation(_ operation: String, target: String = "", successNotice: String) {
+        guard loadActivity == .idle else {
+            presentBusy()
+            return
+        }
+        beginMutation()
         Task {
-            defer { loading = false }
             do {
-                _ = try await V3ServiceBridge.shared.request(operation: "signOut")
+                accept(try await V3ServiceBridge.shared.request(operation: operation, target: target))
+                finishMutation()
+                notice = successNotice
                 reload()
-            } catch { failed(error) }
+            } catch {
+                finishMutation()
+                failed(error)
+            }
         }
     }
-    func jit(target: String) {
-        loading = true
-        Task {
-            defer { loading = false }
-            do {
-                _ = try await V3ServiceBridge.shared.request(operation: "jit", target: target)
-                reload()
-            } catch { failed(error) }
-        }
-    }
-    func syncAppIDs() {
-        loading = true
-        Task {
-            defer { loading = false }
-            do {
-                _ = try await V3ServiceBridge.shared.request(operation: "syncAppIDs")
-                reload()
-            } catch { failed(error) }
-        }
-    }
-    func clearCache() {
-        loading = true
-        Task {
-            defer { loading = false }
-            do {
-                _ = try await V3ServiceBridge.shared.request(operation: "clearCache")
-            } catch { failed(error) }
-        }
-    }
-    func refreshSources() {
-        loading = true
-        Task {
-            defer { loading = false }
-            do {
-                _ = try await V3ServiceBridge.shared.request(operation: "refreshSources")
-                reload()
-            } catch { failed(error) }
-        }
-    }
+    func signOut() { runMutation("signOut", successNotice: "Signed out successfully.") }
+    func jit(target: String) { runMutation("jit", target: target, successNotice: "JIT enabled.") }
+    func syncAppIDs() { runMutation("syncAppIDs", successNotice: "App IDs synced.") }
+    func clearCache() { runMutation("clearCache", successNotice: "Download cache cleared.") }
+    func refreshSources() { runMutation("refreshSources", successNotice: "Sources updated.") }
     func stageSharedFile(_ data: Data) -> String? {
         guard !data.isEmpty, data.count <= 4_194_304 else {
             self.error = "The selected file is empty or too large to hand to the SideStore service."
@@ -360,21 +1266,310 @@ final class V3SideStoreStatusStore: ObservableObject {
         LCUtils.appGroupUserDefault.set(data, forKey: "V3SharedFile." + token)
         return token
     }
-    func stageSharedIPA(_ url: URL, bookmark: Data? = nil, title: String) {
-        guard presentation == nil else { return }
+    func beginInstallPicker() {
+        NSLog("[V3_INSTALL_UI] tap")
+        guard presentation == nil else {
+            NSLog("[V3_INSTALL_UI] tap_rejected reason=presentation_active")
+            error = "Another operation is already running. Finish or cancel it before installing another app."
+            return
+        }
+        guard !installAttempt.hasActiveAttempt else {
+            NSLog("[V3_INSTALL_UI] tap_rejected reason=attempt_not_idle phase=%@",
+                  installAttempt.phase.rawValue)
+            error = hasUncertainInstallCancellation
+                ? "SideStore has not confirmed that the previous install stopped. No new install was started; retry cancellation."
+                : "An install attempt is still being resolved. Wait for it to finish, then try again."
+            return
+        }
+        guard let attemptID = installAttempt.beginPicker() else {
+            NSLog("[V3_INSTALL_UI] tap_rejected reason=attempt_not_idle phase=%@",
+                  installAttempt.phase.rawValue)
+            error = "An install attempt is still being resolved. Wait for it to finish, then try again."
+            return
+        }
+        operationRecoveryDestination = nil
+        NSLog("[V3_INSTALL_UI] begin_attempt result=started attempt=%@ loading=%d",
+              attemptID.uuidString, loading ? 1 : 0)
+    }
+
+    func installPickerPresentationRequested(attemptID: UUID) {
+        NSLog("[V3_INSTALL_UI] picker_present_requested attempt=%@", attemptID.uuidString)
+    }
+
+    func installPickerDidPresent(attemptID: UUID) {
+        NSLog("[V3_INSTALL_UI] picker_did_present attempt=%@", attemptID.uuidString)
+    }
+
+    func installPickerPresentationFailed(attemptID: UUID, reason: String) {
+        NSLog("[V3_INSTALL_UI] tap_rejected reason=%@ attempt=%@", reason, attemptID.uuidString)
+        NSLog("[V3_INSTALL_UI] picker_present_failed attempt=%@ reason=%@",
+              attemptID.uuidString, reason)
+        let token = resetInstallUI(attemptID: attemptID, outcome: "picker_presentation_failed")
+        if let token { Task { _ = await cleanupStagedIPA(token, allowLocalFallback: true) } }
+        error = "The IPA picker could not be opened. Tap Install / Sideload App to try again."
+    }
+
+    func cancelInstallPicker(attemptID: UUID) {
+        if let pending = pendingPickerError, pending.attemptID == attemptID {
+            pendingPickerError = nil
+            NSLog("[V3_INSTALL_UI] terminal attempt=%@ outcome=staging_failed", attemptID.uuidString)
+            error = pending.message
+            return
+        }
+        guard installAttempt.attemptID == attemptID else { return }
+        let token = resetInstallUI(attemptID: attemptID, outcome: "picker_cancelled")
+        if let token { Task { _ = await cleanupStagedIPA(token, allowLocalFallback: true) } }
+    }
+
+    @discardableResult
+    func stagePickerIPA(_ url: URL, attemptID: UUID) -> String? {
+        NSLog("[V3_INSTALL_UI] picker_selected attempt=%@", attemptID.uuidString)
+        guard installAttempt.beginStaging(attemptID: attemptID) else {
+            NSLog("[V3_INSTALL_UI] picker_selection_rejected attempt=%@ reason=stale_attempt",
+                  attemptID.uuidString)
+            return nil
+        }
+        NSLog("[V3_INSTALL_STATE] attempt=%@ event=staging_started", attemptID.uuidString)
+        return stageIPA(url, attemptID: attemptID, bookmark: nil,
+                        title: "Install / Sideload App with SideStore",
+                        waitsForPickerDismissal: true)
+    }
+
+    @discardableResult
+    func stageSharedIPA(_ url: URL, bookmark: Data? = nil, title: String) -> String? {
+        guard presentation == nil, !installAttempt.hasActiveAttempt,
+              let attemptID = installAttempt.beginDirectStaging() else {
+            error = "Another operation is already running. Finish or cancel it before installing another app."
+            return nil
+        }
+        return stageIPA(url, attemptID: attemptID, bookmark: bookmark, title: title,
+                        waitsForPickerDismissal: false)
+    }
+
+    func cleanupOrphanedStagedIPAs() async {
+        guard let container = V3IPAStaging.sideStoreContainerRoot() else { return }
+        var protectedTokens = Set<String>()
+        if let hostToken = installAttempt.token,
+           let canonical = try? V3IPAStaging.canonicalToken(hostToken) {
+            protectedTokens.insert(canonical)
+        }
         do {
-            guard url.isFileURL, url.pathExtension.lowercased() == "ipa" else {
-                throw NSError(domain: "V3IPASelection", code: 1,
-                              userInfo: [NSLocalizedDescriptionKey: "Choose an IPA file to install with SideStore. Other files cannot be installed."])
+            // Age alone cannot prove a staged file is unused: native callbacks
+            // may leave a backend mutation alive past its request deadline.
+            // Ask the service for active token ownership and fail closed if the
+            // service cannot give an authoritative answer.
+            let reply = try await V3ServiceBridge.shared.request(operation: "ipaActiveTokens")
+            guard let tokens = reply["tokens"] as? [String], tokens.count <= 512 else { return }
+            for token in tokens {
+                guard let canonical = try? V3IPAStaging.canonicalToken(token) else { return }
+                protectedTokens.insert(canonical)
             }
-            let scoped = url.startAccessingSecurityScopedResource()
-            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-            let token = UUID().uuidString
-            let data = try bookmark ?? url.bookmarkData(options: URL.BookmarkCreationOptions(rawValue: 1 << 11),
-                                                       includingResourceValuesForKeys: nil, relativeTo: nil)
-            LCUtils.appGroupUserDefault.set(data, forKey: "V3SharedIPA." + token)
-            perform("installSharedIPA", target: token, title: title)
-        } catch { self.error = error.localizedDescription }
+            _ = try V3IPAStaging.cleanupOrphans(containerRoot: container,
+                preservingTokens: protectedTokens)
+        } catch {
+            // Unavailable ownership means skip pruning. Do not expose paths or
+            // filenames in user-copyable logs.
+        }
+    }
+
+    private func stageIPA(_ url: URL, attemptID: UUID, bookmark: Data?, title: String,
+                          waitsForPickerDismissal: Bool) -> String? {
+        do {
+            guard let container = V3IPAStaging.sideStoreContainerRoot() else {
+                throw CombinedIPAFileError(.fileAccess)
+            }
+            let token = try V3IPAStaging.stage(sourceURL: url, bookmark: bookmark, containerRoot: container)
+            guard installAttempt.staged(attemptID: attemptID, token: token, title: title,
+                                        waitsForPickerDismissal: waitsForPickerDismissal,
+                                        isLoading: loading) else {
+                _ = resetInstallUI(attemptID: attemptID, outcome: "stage_handoff_failed")
+                Task { _ = await cleanupStagedIPA(token, allowLocalFallback: true) }
+                let message = "The selected IPA could not be queued for presentation. Choose it again."
+                if waitsForPickerDismissal { pendingPickerError = (attemptID, message) }
+                else { error = message }
+                return nil
+            }
+            NSLog("[V3_INSTALL_UI] staged attempt=%@ phase=%@ loading=%d",
+                  attemptID.uuidString, installAttempt.phase.rawValue, loading ? 1 : 0)
+            if !waitsForPickerDismissal {
+                drainInstallPresentation(trigger: "input_staged")
+            }
+            return token
+        } catch let failure as CombinedIPAFileError {
+            _ = resetInstallUI(attemptID: attemptID, outcome: "staging_failed")
+            if waitsForPickerDismissal { pendingPickerError = (attemptID, V3FailureGuidance.message(failure)) }
+            else { self.error = V3FailureGuidance.message(failure) }
+        } catch {
+            _ = resetInstallUI(attemptID: attemptID, outcome: "staging_failed")
+            let message = CombinedIPAFileError(.stagingFailed).localizedDescription
+            if waitsForPickerDismissal { pendingPickerError = (attemptID, message) }
+            else { self.error = message }
+        }
+        return nil
+    }
+
+    private func drainInstallPresentation(trigger: String) {
+        guard let request = installAttempt.takeReadyOperation(
+            isLoading: loading, hasActiveOperationPresentation: presentation != nil
+        ) else {
+            if installAttempt.hasActiveAttempt {
+                NSLog("[V3_INSTALL_UI] operation_present_wait trigger=%@ phase=%@ loading=%d presentation_active=%d",
+                      trigger, installAttempt.phase.rawValue, loading ? 1 : 0,
+                      presentation == nil ? 0 : 1)
+            }
+            return
+        }
+        NSLog("[V3_INSTALL_UI] host_cover_request attempt=%@ operation=%@ trigger=%@",
+              request.attemptID.uuidString, request.operationID.uuidString, trigger)
+        presentation = V3OperationRequest(id: request.operationID, operation: "installSharedIPA",
+            target: request.token, title: request.title, installAttemptID: request.attemptID)
+        NSLog("[V3_INSTALL_UI] operation_present_requested attempt=%@ operation=%@",
+              request.attemptID.uuidString, request.operationID.uuidString)
+    }
+
+    func installPickerDidDisappear(attemptID: UUID) {
+        guard installAttempt.pickerDidDisappear(attemptID: attemptID, isLoading: loading) else { return }
+        NSLog("[V3_INSTALL_UI] picker_dismissed attempt=%@ loading=%d",
+              attemptID.uuidString, loading ? 1 : 0)
+        drainInstallPresentation(trigger: "picker_did_dismiss")
+    }
+
+    func installBackendStartRequested(attemptID: UUID?, operationID: UUID, sessionID: String) {
+        guard let attemptID,
+              installAttempt.backendStartRequested(attemptID: attemptID,
+                  operationID: operationID, sessionID: sessionID) else { return }
+        NSLog("[V3_INSTALL_STATE] attempt=%@ event=backend_start_requested session=%@",
+              attemptID.uuidString, sessionID)
+    }
+
+    func installOperationDidPresent(attemptID: UUID?, operationID: UUID) {
+        guard let attemptID,
+              installAttempt.markOperationViewDidAppear(attemptID: attemptID, operationID: operationID) else { return }
+        NSLog("[V3_INSTALL_UI] operation_did_present attempt=%@ operation=%@",
+              attemptID.uuidString, operationID.uuidString)
+    }
+
+    func installBackendStarted(attemptID: UUID?, operationID: UUID, sessionID: String) {
+        guard let attemptID,
+              installAttempt.backendStarted(attemptID: attemptID, operationID: operationID, sessionID: sessionID) else { return }
+        NSLog("[V3_INSTALL_STATE] attempt=%@ phase=operationStarted backend_session=%@",
+              attemptID.uuidString, sessionID)
+    }
+
+    func installTerminal(attemptID: UUID?, operationID: UUID, outcome: String) {
+        guard let attemptID,
+              installAttempt.recordTerminal(attemptID: attemptID, operationID: operationID, outcome: outcome) else { return }
+        NSLog("[V3_INSTALL_UI] terminal attempt=%@ operation=%@ outcome=%@",
+              attemptID.uuidString, operationID.uuidString, outcome)
+    }
+
+    func prepareInstallRetry(attemptID: UUID?) {
+        guard let attemptID, let operationID = presentation?.id,
+              installAttempt.prepareRetry(attemptID: attemptID, operationID: operationID) else { return }
+        NSLog("[V3_INSTALL_UI] retry_started attempt=%@ operation=%@",
+              attemptID.uuidString, operationID.uuidString)
+    }
+
+    @discardableResult
+    func resetInstallUI(attemptID: UUID, outcome: String,
+                        preserveRecoveryDestination: Bool = false) -> String? {
+        guard installAttempt.attemptID == attemptID else { return nil }
+        let token = installAttempt.token
+        switch installAttempt.phase {
+        case .terminal:
+            guard installAttempt.beginCleanup(attemptID: attemptID),
+                  installAttempt.finishCleanup(attemptID: attemptID) else { return nil }
+        case .cleaningUp:
+            guard installAttempt.finishCleanup(attemptID: attemptID) else { return nil }
+        default:
+            guard installAttempt.resetBeforeBackend(attemptID: attemptID) else { return nil }
+        }
+        if presentation?.installAttemptID == attemptID { presentation = nil }
+        if pendingPickerError?.attemptID == attemptID { pendingPickerError = nil }
+        if !preserveRecoveryDestination { operationRecoveryDestination = nil }
+        NSLog("[V3_INSTALL_UI] reset_to_idle attempt=%@ outcome=%@",
+              attemptID.uuidString, outcome)
+        return token
+    }
+
+    func operationCoverDidDismiss() {
+        guard let attemptID = installAttempt.attemptID,
+              installAttempt.phase == .operationPresented,
+              !installAttempt.operationViewDidAppear,
+              installAttempt.backendSessionID == nil else { return }
+        let token = resetInstallUI(attemptID: attemptID, outcome: "operation_presentation_failed")
+        error = "The install screen could not be opened. The attempt was cleared; tap Install / Sideload App again."
+        if let token { Task { _ = await cleanupStagedIPA(token, allowLocalFallback: true) } }
+    }
+
+    func retryInstallCancellation() {
+        guard let attemptID = installAttempt.attemptID,
+              let operationID = installAttempt.operationID,
+              let sessionID = installAttempt.backendSessionID else {
+            error = "No install session is available to cancel. Keep this screen open and reload operation status."
+            return
+        }
+        Task { @MainActor in
+            do {
+                let reply = try await V3ServiceBridge.shared.request(operation: "opCancel", target: sessionID)
+                guard let terminalState = V3OperationCancellationOutcomePolicy.terminalState(
+                    expectedSessionID: sessionID,
+                    replySessionID: reply["session"] as? String,
+                    state: reply["state"] as? String,
+                    backendSettled: V3ServiceBridge.strictBool(reply["backendSettled"]),
+                    stopConfirmed: V3ServiceBridge.strictBool(reply["stopConfirmed"]),
+                    outcomeUnknown: V3OperationReplyFieldPolicy.outcomeUnknown(reply["outcomeUnknown"])) else {
+                    self.error = "SideStore has not confirmed that the device operation stopped. The IPA and operation session were kept; retry cancellation or check device state before another install."
+                    return
+                }
+                _ = installAttempt.recordTerminal(attemptID: attemptID,
+                    operationID: operationID, outcome: terminalState)
+                self.error = terminalState == "cancelled" ? nil :
+                    (terminalState == "completed"
+                        ? "The install completed before cancellation was confirmed."
+                        : "The install ended with a failure before cancellation was confirmed.")
+                let token = resetInstallUI(attemptID: attemptID, outcome: terminalState)
+                if let token { _ = await cleanupStagedIPA(token, allowLocalFallback: true) }
+                reload()
+            } catch {
+                NSLog("[V3_INSTALL_UI] cancellation_unconfirmed attempt=%@ session=%@",
+                      attemptID.uuidString, sessionID)
+                self.error = "SideStore still cannot confirm that the install stopped. No new install was started. Reconnect, then retry cancellation."
+            }
+        }
+    }
+
+    func cleanupStagedIPA(_ token: String, allowLocalFallback: Bool = false) async -> Bool {
+        do {
+            _ = try await V3ServiceBridge.shared.request(operation: "ipaCleanup", target: token)
+            return true
+        } catch {
+            let serviceReportsBusy = (error as? CombinedFailure).map {
+                $0.code == .busy ||
+                    $0.safeCause == .operationInProgress
+            } ?? false
+            guard V3StagedIPACleanupFallbackPolicy.mayDeleteLocally(
+                serviceReportsBusy: serviceReportsBusy,
+                callerConfirmsNeverStartedOrSettled: allowLocalFallback) else {
+                NSLog("[V3_INSTALL_UI] staged_cleanup_deferred reason=%@",
+                      serviceReportsBusy ? "service_busy" : "backend_state_unconfirmed")
+                return false
+            }
+            // The host uses the same canonical UUID-only staging helper for a
+            // local fallback only when no backend can still use the token. It
+            // never accepts or constructs a caller path.
+            do {
+                guard let container = V3IPAStaging.sideStoreContainerRoot() else {
+                    throw CombinedIPAFileError(.fileAccess)
+                }
+                try V3IPAStaging.cleanup(token: token, containerRoot: container)
+                NSLog("[V3_INSTALL_UI] staged_cleanup_fallback result=success")
+                return true
+            } catch {
+                NSLog("[V3_INSTALL_UI] staged_cleanup_failed reason=service_and_local_cleanup_unavailable")
+                return false
+            }
+        }
     }
 }
 
@@ -429,6 +1624,7 @@ struct V3InstalledAppsSection: View {
                     .padding(.vertical, 2)
                     .background(Capsule().fill(Color(UIColor.secondarySystemFill)))
             }
+            V3RefreshAllButton()
             if status.isStale {
                 Button {
                     status.reload()
@@ -586,7 +1782,22 @@ struct V3SourcesView: View {
     @EnvironmentObject private var status: V3SideStoreStatusStore
     @State private var preview: [String: Any]?
     @State private var previewBusy = false
+    @State private var addBusy = false
+    @State private var removeBusy = false
+    @State private var notice = ""
+    @State private var sourceFailure: V3SourceAddFailure?
+    @State private var failedSourceInput: String?
+    // V3_SOURCE_SEMANTIC_STATE_V1: a successful add is a success, and is never
+    // rendered with the same neutral grey as an informational note.
+    @State private var addSucceeded = false
     @State private var removeCandidate: V3SideStoreSource?
+    // V3_SOURCE_KEYBOARD_DISMISS_V1 (issue #40): the field had no focus state and
+    // no explicit dismiss action, so the only way out of the keyboard felt like
+    // Return, which read as if Return were also the submit action.
+    @FocusState private var sourceFieldFocused: Bool
+    // @State so the pre-edit value survives; the view is a struct, so a plain
+    // stored var could not be assigned from a non-mutating method.
+    @State private var sourceURLBeforeEditing: String = ""
     private var savedGuestSources: [String] {
         (UserDefaults.standard.stringArray(forKey: "LCAltStoreSourceURLs") ?? [])
             .filter { saved in !status.sources.contains(where: { $0.url == saved }) }
@@ -594,6 +1805,43 @@ struct V3SourcesView: View {
     var body: some View {
         NavigationView {
             List {
+                if addSucceeded && !notice.isEmpty {
+                    Section {
+                        Label(notice, systemImage: V3StatusSeverity.completed.icon)
+                            .font(.footnote)
+                            .foregroundColor(.green)
+                    }
+                } else if !notice.isEmpty {
+                    Section {
+                        // V3_SOURCE_SEMANTIC_STATE_V1: an informational notice is
+                        // neutral, never styled as if it were a result.
+                        Label(notice, systemImage: "info.circle.fill")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                if let sourceFailure {
+                    Section("What happened") {
+                        // A source failure is a failure, and says so.
+                        Label(sourceFailure.whatHappened, systemImage: V3StatusSeverity.failed.icon)
+                            .font(.footnote)
+                            .foregroundColor(.red)
+                    }
+                    Section("What you can do") {
+                        Text(sourceFailure.whatToDo).font(.footnote)
+                    }
+                    Section {
+                        DisclosureGroup("Technical details") {
+                            Text(sourceFailure.technicalDetails)
+                                .font(.caption2)
+                                .textSelection(.enabled)
+                        }
+                        Button("Copy Diagnostics") {
+                            UIPasteboard.general.string = sourceFailure.technicalDetails
+                        }
+                        .font(.caption)
+                    }
+                }
                 Section("Add Source") {
                     HStack {
                         Image(systemName: "link")
@@ -602,13 +1850,47 @@ struct V3SourcesView: View {
                             .keyboardType(.URL)
                             .autocapitalization(.none)
                             .disableAutocorrection(true)
+                            .focused($sourceFieldFocused)
+                            // Return only dismisses the keyboard. It never
+                            // previews and never adds a source.
+                            .submitLabel(.done)
+                            .onSubmit { dismissKeyboard() }
+                            // The pre-edit value is captured when editing actually
+                            // begins, which is focus. It used to be captured when a
+                            // preview was requested, so a Cancel after typing but
+                            // before previewing restored the wrong value, and a
+                            // Cancel after previewing restored the value that was
+                            // already on screen. Only the rising edge captures,
+                            // because Cancel itself drops focus and must not
+                            // overwrite the value it is about to restore.
+                    .onChange(of: sourceFieldFocused) { focused in
+                        if focused { sourceURLBeforeEditing = status.sourceURL }
+                    }
+                    .onChange(of: status.sourceURL) { newURL in
+                        if failedSourceInput != newURL {
+                            sourceFailure = nil
+                            failedSourceInput = nil
+                        }
+                        if let previewURL = preview?["url"] as? String, previewURL != newURL {
+                            preview = nil
+                        }
+                    }
+                    }
+                    // Explicit keyboard dismissal, with an explicit Cancel that
+                    // performs no preview, no network request and no persistence.
+                    .toolbar {
+                        ToolbarItemGroup(placement: .keyboard) {
+                            Spacer()
+                            Button("Cancel") { cancelSourceEditing() }
+                            Button("Done") { dismissKeyboard() }
+                        }
                     }
                     Button {
                         Task { await previewSource() }
                     } label: {
                         Label(previewBusy ? "Checking Source..." : "Preview and Add Source", systemImage: "plus.circle.fill")
                     }
-                    .disabled(status.sourceURL.isEmpty || previewBusy)
+                    .disabled(status.sourceURL.isEmpty || previewBusy || isSubmissionBlocked(for: status.sourceURL))
                     if let preview {
                         VStack(alignment: .leading, spacing: 4) {
                             Text(preview["name"] as? String ?? "")
@@ -623,9 +1905,10 @@ struct V3SourcesView: View {
                         Button {
                             Task { await confirmAdd(url: preview["url"] as? String ?? status.sourceURL) }
                         } label: {
-                            Label((preview["alreadyAdded"] as? Bool ?? false) ? "Already Added" : "Confirm Add Source", systemImage: "checkmark.circle.fill")
+                            Label((preview["alreadyAdded"] as? Bool ?? false) ? "Already Added" : (addBusy ? "Adding Source..." : "Confirm Add Source"), systemImage: "checkmark.circle.fill")
                         }
-                        .disabled(preview["alreadyAdded"] as? Bool ?? false)
+                        .disabled((preview["alreadyAdded"] as? Bool ?? false) || addBusy ||
+                            isSubmissionBlocked(for: preview["url"] as? String ?? status.sourceURL))
                     }
                 }
                 Section("Sources (\(status.sources.count))") {
@@ -686,6 +1969,7 @@ struct V3SourcesView: View {
                     } label: {
                         Image(systemName: "arrow.clockwise")
                     }
+                    .disabled(status.loading)
                 }
             }
             .confirmationDialog("Remove this source?", isPresented: Binding(get: { removeCandidate != nil }, set: { if !$0 { removeCandidate = nil } }), titleVisibility: .visible) {
@@ -701,29 +1985,92 @@ struct V3SourcesView: View {
         }
         .navigationViewStyle(StackNavigationViewStyle())
     }
+    // V3_SOURCE_KEYBOARD_DISMISS_V1: dismissing the keyboard is a pure UI action.
+    // It previews nothing, requests nothing and persists nothing.
+    /// Done keeps the typed value and dismisses the keyboard. It is a pure UI
+    /// dismissal: it never previews, requests, or persists anything.
+    private func dismissKeyboard() {
+        sourceFieldFocused = false
+        _ = V3SourceEditingPolicy.done(typed: status.sourceURL)
+    }
+
+    /// Cancel restores the URL that was present when editing began and dismisses
+    /// the keyboard.
+    ///
+    /// It performs no network request, no preview and no source mutation. It
+    /// deliberately does not discard an already-rendered preview either: a
+    /// preview the user just spent a request on used to vanish silently,
+    /// together with its Confirm action, which is a source mutation the user
+    /// never asked to lose.
+    private func cancelSourceEditing() {
+        status.sourceURL = V3SourceEditingPolicy.resolved(
+            V3SourceEditingPolicy.cancel(typed: status.sourceURL, beforeEditing: sourceURLBeforeEditing),
+            typed: status.sourceURL)
+        sourceFieldFocused = false
+    }
+
     private func previewSource() async {
         previewBusy = true
         defer { previewBusy = false }
+        sourceFailure = nil
+        failedSourceInput = nil
+        notice = ""
+        addSucceeded = false
         do {
             var row = try await V3ServiceBridge.shared.request(operation: "sourcePreview", target: status.sourceURL)
             row["url"] = status.sourceURL
             preview = row
-        } catch { status.error = error.localizedDescription }
+            // Previewing is an explicit action, so the keyboard has served its
+            // purpose once the preview is on screen.
+            dismissKeyboard()
+        } catch {
+            sourceFailure = V3SourceAddFailure(error)
+            failedSourceInput = status.sourceURL
+        }
     }
     private func confirmAdd(url: String) async {
+        addBusy = true
+        notice = ""
+        sourceFailure = nil
+        failedSourceInput = nil
+        defer { addBusy = false }
         do {
-            _ = try await V3ServiceBridge.shared.request(operation: "sourceAddConfirmed", target: url)
+            let result = try await V3ServiceBridge.shared.request(operation: "sourceAddConfirmed", target: url)
+            guard let message = V3SourceAddPersistencePolicy.confirmationMessage(result),
+                  let identifier = result["identifier"] as? String,
+                  let sources = result["sources"] as? [[String: Any]],
+                  sources.contains(where: { $0["identifier"] as? String == identifier }) else {
+                throw V3SourceAddPersistencePolicy.unverifiedPersistenceFailure(
+                    correlationID: UUID().uuidString)
+            }
+            status.accept(result)
             preview = nil
             status.sourceURL = ""
-            status.reload()
-        } catch { status.error = error.localizedDescription }
+            failedSourceInput = nil
+            notice = message
+            addSucceeded = true
+        } catch {
+            sourceFailure = V3SourceAddFailure(error)
+            failedSourceInput = url
+        }
+    }
+
+    private func isSubmissionBlocked(for input: String) -> Bool {
+        guard let sourceFailure else { return false }
+        return !V3SourceSubmissionPolicy.mayResubmit(retryable: sourceFailure.retryable,
+            safeCause: sourceFailure.safeCause,
+            failedInput: failedSourceInput, currentInput: input)
     }
     private func confirmRemove(id: String) async {
         removeCandidate = nil
+        removeBusy = true
+        notice = "Removing source..."
+        defer { removeBusy = false }
         do {
             _ = try await V3ServiceBridge.shared.request(operation: "sourceRemoveConfirmed", target: id)
+            notice = "Source removed."
             status.reload()
-        } catch { status.error = error.localizedDescription }
+        } catch { status.present(error) }
     }
 }
 
@@ -731,23 +2078,30 @@ struct V3CatalogApp: Identifiable {
     let id: String, name: String, version: String, developer: String, description: String, installedID: String
     let canInstall: Bool
     let downloadURL: String
+    let installedVersion: String?
     init?(_ row: [String: Any]) {
-        guard let id = row["identifier"] as? String, let name = row["name"] as? String else { return nil }
+        guard V3CatalogRowPolicy.isDisplayable(row),
+              let id = row["identifier"] as? String,
+              let name = row["name"] as? String else { return nil }
         self.id = id; self.name = name; version = row["version"] as? String ?? ""
         developer = row["developer"] as? String ?? ""; description = row["description"] as? String ?? ""
         installedID = row["installedID"] as? String ?? ""; canInstall = row["canInstall"] as? Bool ?? false
         downloadURL = row["downloadURL"] as? String ?? ""
+        installedVersion = row["installedVersion"] as? String
     }
 }
 
 struct V3CatalogView: View {
     @EnvironmentObject private var status: V3SideStoreStatusStore
     @EnvironmentObject private var sharedModel: SharedModel
+    @Environment(\.dismiss) private var dismiss
     let source: V3SideStoreSource
     @State private var apps: [V3CatalogApp] = []
     @State private var query = ""
     @State private var loading = true
     @State private var error: String?
+    @State private var failure: V3OperationFailureDetails?
+    @State private var loadInFlight = false
     var body: some View {
         List {
             if loading {
@@ -759,9 +2113,32 @@ struct V3CatalogView: View {
                 .padding()
             }
             if let error {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(error).font(.caption).foregroundColor(.red)
-                    Button("Retry") { Task { await load() } }
+                Section("What happened") {
+                    Text(failure?.whatHappened ?? error).font(.footnote).foregroundColor(.red)
+                    if let failure {
+                        Text("What you can do").font(.caption.weight(.semibold)).padding(.top, 4)
+                        Text(failure.whatToDo).font(.footnote)
+                        DisclosureGroup("Technical details") {
+                            Text(failure.technical).font(.caption2).textSelection(.enabled)
+                        }
+                        Button("Copy Diagnostics") { UIPasteboard.general.string = failure.technical }
+                    }
+                    if failure?.safeCause == CombinedFailure.SafeCause.catalogSourceUnavailable.rawValue {
+                        Button("Return to Sources") { dismiss() }
+                    }
+                    switch V3CatalogRetryPresentationPolicy.action(
+                        for: failure?.retryDisposition ?? .unknown,
+                        safeCause: failure?.safeCause) {
+                    case .retry:
+                        Button("Retry Catalog") { Task { await load() } }.disabled(loadInFlight)
+                    case .retryWithUnknownDisposition:
+                        Button("Try Catalog Again (retryability unknown)") { Task { await load() } }
+                            .disabled(loadInFlight)
+                    case .reloadCatalog:
+                        Button("Reload Catalog") { Task { await load() } }.disabled(loadInFlight)
+                    case .noRetry:
+                        EmptyView()
+                    }
                 }
             }
             ForEach(apps.filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) }) { app in
@@ -858,23 +2235,71 @@ struct V3CatalogView: View {
         .task { await load() }
     }
     private func load() async {
+        guard !loadInFlight else { return }
+        loadInFlight = true
+        defer { loadInFlight = false }
         loading = true
         error = nil
+        failure = nil
         defer { loading = false }
         do {
             var cursor = 0
-            apps = []
+            // V3_CATALOG_ROW_POLICY_V1: retain the raw rows and a persistent
+            // identifier set across pages, then map once. Re-deduplicating the
+            // full accumulated array for every page made large catalogs quadratic.
+            var accumulated = V3CatalogRowsAccumulator()
             repeat {
                 try Task.checkCancellation()
+                // V3_CATALOG_PAGE_VALIDATION_V1: a page is validated instead of
+                // being coerced. A missing or mistyped app list is no longer
+                // silently shown as an empty catalog, and a cursor that does not
+                // advance is a typed invalid response rather than a raw error.
                 let result = try await V3ServiceBridge.shared.request(operation: "catalog", target: source.identifier, cursor: cursor)
-                let page = (result["apps"] as? [[String: Any]] ?? []).compactMap(V3CatalogApp.init)
-                let existing = Set(apps.map(\.id))
-                apps.append(contentsOf: page.filter { !existing.contains($0.id) })
-                let next = result["nextCursor"] as? Int ?? -1
-                guard next == -1 || next > cursor else { throw NSError(domain: "V3Catalog", code: 1) }
+                guard let rawApps = result["apps"] as? [[String: Any]] else {
+                    throw catalogResponseFailure(cursor: cursor)
+                }
+                guard rawApps.allSatisfy(V3CatalogRowPolicy.isDisplayable) else {
+                    throw catalogResponseFailure(cursor: cursor)
+                }
+                guard let number = result["nextCursor"] as? NSNumber,
+                      CFGetTypeID(number) != CFBooleanGetTypeID(),
+                      let next = number as? Int else {
+                    throw catalogResponseFailure(cursor: cursor)
+                }
+                // The real deduplication rule: duplicates are removed within a
+                // page and across pages, first-seen order preserved.
+                accumulated.append(rawApps)
+                guard next == -1 || next > cursor else { throw catalogResponseFailure(cursor: cursor) }
                 cursor = next
             } while cursor >= 0
-        } catch { self.error = error.localizedDescription }
+            let mappedApps = accumulated.rows.compactMap(V3CatalogApp.init)
+            guard mappedApps.count == accumulated.rows.count else { throw catalogResponseFailure(cursor: cursor) }
+            apps = mappedApps
+        } catch is CancellationError {
+            // A cancelled load is lifecycle, not a catalog failure. Presenting it
+            // as an error would blame the source for a navigation change.
+            error = nil
+            failure = nil
+        } catch {
+            if let combined = error as? CombinedFailure {
+                failure = V3OperationFailureDetails(combined)
+                self.error = combined.safeMessage
+            } else {
+                failure = nil
+                self.error = "The source catalog could not be loaded."
+            }
+        }
+    }
+
+    // V3_CATALOG_DIAGNOSTICS_V1: an unreadable page is reported against the
+    // catalog stage with the request's own correlation, and never contains the
+    // source identifier, app rows, or any raw payload.
+    private func catalogResponseFailure(cursor: Int) -> CombinedFailure {
+        var failure = CombinedFailure(operation: "catalog", stage: .catalog, code: .invalidResponse,
+                                     id: UUID().uuidString, safeCause: .catalogUnavailable,
+                                     sourceStep: .catalogRead)
+        failure.annotatingCatalogPage(cursor: cursor)
+        return failure
     }
 }
 
@@ -931,10 +2356,29 @@ struct V3AccountSettings: View {
                         .foregroundColor(.secondary)
                 }
             }
-            NavigationLink {
-                V3SignInView().environmentObject(status)
-            } label: {
-                Label("Sign In / Re-authenticate", systemImage: "person.badge.key.fill")
+            // V3_PROVISIONING_NEEDS_ATTENTION_V1: an authenticated session with
+            // incomplete provisioning is signed in, so the recovery row is
+            // presented as provisioning work, never as a sign-in problem. It is
+            // placed before the signed-in-only block because
+            // provisioningIncomplete can only be true for a signed-in account.
+            if status.provisioningIncomplete {
+                NavigationLink {
+                    V3SignInView().environmentObject(status)
+                } label: {
+                    Label("Provisioning needs attention", systemImage: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                }
+                .accessibilityHint("Apple ID is signed in. Retry provisioning or finish later.")
+            }
+            // Account status is available only for a signed-in account. When
+            // signed out, the section above already offers Sign In.
+            if !status.needsSignIn {
+                NavigationLink {
+                    V3SignInView().environmentObject(status)
+                } label: {
+                    Label("Sign-In Status", systemImage: "person.badge.key.fill")
+                }
+                .accessibilityHint("Review the current Apple sign-in state")
             }
             Button {
                 status.syncAppIDs()
@@ -943,10 +2387,12 @@ struct V3AccountSettings: View {
             }
             link("Certificates", icon: "doc.text") { V3CertificatesView().environmentObject(status) }
             link("Developer Services", icon: "wrench.and.screwdriver") { V3DeveloperServicesView().environmentObject(status) }
-            Button(role: .destructive) {
-                status.signOut()
-            } label: {
-                Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
+            if !status.needsSignIn {
+                Button(role: .destructive) {
+                    status.signOut()
+                } label: {
+                    Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
+                }
             }
         }
 
@@ -1021,6 +2467,9 @@ struct V3BoolSettingRow: View {
     let icon: String
     @State private var value = false
     @State private var loaded = false
+    @State private var loadingRequest = false
+    @State private var writeGenerations = V3SettingsWriteGeneration()
+    @State private var confirmedValue: Bool?
     var body: some View {
         Toggle(isOn: Binding(get: { value }, set: { value = $0; save($0) })) {
             Label(title, systemImage: icon)
@@ -1029,24 +2478,78 @@ struct V3BoolSettingRow: View {
         .task { await load() }
     }
     private func load() async {
+        guard !loadingRequest else { return }
+        loadingRequest = true
+        defer { loadingRequest = false }
         do {
             let reply = try await V3ServiceBridge.shared.request(operation: "settingsGet")
             if let bools = reply["bools"] as? [String: Bool], let current = bools[key] {
                 value = current
+                confirmedValue = current
             } else if let legacy = status.settings[key] {
                 value = legacy
+                confirmedValue = legacy
             }
             loaded = true
-        } catch { status.error = error.localizedDescription }
+        } catch { status.present(error) }
     }
     private func save(_ newValue: Bool) {
+        let generation = writeGenerations.begin(key)
         Task {
             do {
                 _ = try await V3ServiceBridge.shared.request(operation: "settingsSet",
                     payload: ["key": key, "type": "bool", "bool": newValue])
-                status.reload()
-            } catch { status.error = error.localizedDescription }
+                if writeGenerations.isCurrent(generation, for: key) {
+                    confirmedValue = newValue
+                    status.reload()
+                } else {
+                    _ = await reloadAuthoritative(generation: writeGenerations.current(for: key))
+                }
+            } catch {
+                guard writeGenerations.isCurrent(generation, for: key) else { return }
+                let loaded = await reloadAuthoritative(generation: generation)
+                if !loaded, writeGenerations.isCurrent(generation, for: key) {
+                    value = confirmedValue ?? !newValue
+                }
+                status.present(error)
+            }
         }
+    }
+    private func reloadAuthoritative(generation: UInt64) async -> Bool {
+        do {
+            let reply = try await V3ServiceBridge.shared.request(operation: "settingsGet")
+            guard writeGenerations.isCurrent(generation, for: key),
+                  let bools = reply["bools"] as? [String: Bool], let current = bools[key] else { return false }
+            value = current
+            confirmedValue = current
+            status.reload()
+            return true
+        } catch {
+            return false
+        }
+    }
+}
+
+private struct V3SourceAddFailure {
+    let whatHappened: String
+    let whatToDo: String
+    let technicalDetails: String
+    let retryable: Bool?
+    let safeCause: String?
+
+    init(_ error: Error) {
+        let failure: CombinedFailure
+        if let combined = error as? CombinedFailure {
+            failure = V3SourceAddFailurePolicy.normalized(combined)
+        } else {
+            failure = CombinedFailure.capture(error,
+                operation: "source", stage: .source, id: UUID().uuidString)
+        }
+        whatHappened = failure.safeMessage
+        whatToDo = failure.recovery
+        technicalDetails = failure.technicalDetails
+        retryable = failure.retryable
+        safeCause = failure.safeCause?.rawValue
     }
 }
 
@@ -1079,11 +2582,23 @@ struct V3TargetedRefreshSection: View {
                             .foregroundColor(.secondary)
                     }
                 }
+                // V3_REFRESH_PREREQUISITE_POLICY_V1: targeted refresh uses the
+                // same contract. A known-missing pairing file blocks the mutation
+                // and offers the same recovery action instead of starting a run
+                // that can only fail.
+                if V3RefreshPrerequisite.evaluate(pairingStatus: status.pairing).blocksTargetedRefresh {
+                    Text("A pairing file is required before this device can be refreshed.")
+                        .font(.footnote)
+                    Text("Place or import a valid pairing file, then try again.")
+                        .font(.footnote).foregroundColor(.secondary)
+                    Button("Show Pairing Setup") { status.pairingPresented = true }
+                }
                 Button {
                     status.perform("refreshApp", target: target, title: "Refresh " + app.name)
                 } label: {
                     Label("Refresh " + app.name, systemImage: "arrow.clockwise")
                 }
+                .disabled(V3RefreshPrerequisite.evaluate(pairingStatus: status.pairing).blocksTargetedRefresh)
                 Button("Clear Selection") { status.refreshTarget = nil }
             }
         }
@@ -1094,70 +2609,169 @@ struct V3OperationSheet: View {
     @EnvironmentObject private var status: V3SideStoreStatusStore
     @Environment(\.dismiss) private var dismiss
     let request: V3OperationRequest
-    @State private var session: String?
+    @State private var attempt = V3OperationAttemptState()
+    @State private var uncertainSessionID: String?
     @State private var state = "working"
     @State private var progress = 0.0
+    @State private var hasProgress = false
+    @State private var terminalBackendSettled: Bool?
+    @State private var deviceCheckConfirmedForCompletion = false
+    @State private var operationPhase = V3OperationPhase.working
     @State private var prompt: [String: Any]?
     @State private var sourceOffer: [String: String]?
+    @State private var promptResponseBlocked = false
+    @State private var sourceAddFailure: V3OperationFailureDetails?
+    @State private var sourceAddRetryBlocked = false
     @State private var message = ""
     @State private var task: Task<Void, Never>?
-    @State private var started = false
-    private var retryAllowed: Bool { request.operation != "installSharedIPA" }
+    @State private var startedGeneration: UUID?
+    @State private var isDismissing = false
+    @State private var promptSubmitting = false
+    @State private var userRequestedCancellation = false
+    @State private var failureContext = V3OperationRetryContext()
+    @State private var whatToDo = ""
+    @State private var technicalDetails = ""
+    @State private var recoveryDestination: String?
+    @State private var retryBlocked = false
+    @State private var needsDeviceConfirmation = false
+    @State private var confirmUncertainRetirement = false
+    @State private var stagedIPACleaned = false
+    @State private var copied = false
+    private var retryAllowed: Bool {
+        guard !retryBlocked else { return false }
+        if state == "requiresSource" { return sourceOffer != nil }
+        if state == "cancelled" { return true }
+        guard state == "failed", !isTransitioning else { return false }
+        return [.allowed, .unknown].contains(failureContext.retryDisposition)
+    }
+    private var retryButtonTitle: String {
+        V3OperationRetryButtonPolicy.title(state: state,
+            retryDisposition: failureContext.retryDisposition)
+    }
+    private var sourceAddButtonTitle: String {
+        guard let sourceAddFailure else { return "Add Source and Retry" }
+        if sourceAddRetryBlocked { return "Resolve Source Issue" }
+        return sourceAddFailure.retryable == nil
+            ? "Try Source Add Again (retryability unknown)" : "Try Source Add Again"
+    }
+    private func recoveryActionTitle(for destination: String) -> String? {
+        switch destination {
+        case "signIn": return "Open Account & Signing"
+        case "certificates": return "Open Certificates"
+        case "ipa": return "Choose IPA Again"
+        case "connection": return "Open Connection Settings"
+        case "sources": return "Open Sources"
+        // This destination opens the Setup Assistant, so it must say so. It read
+        // "Open Connection Settings" while routing to the assistant, which is the
+        // same class of mislabel as offering a connection retry for a source
+        // failure.
+        case "setup": return "Open Setup Assistant"
+        default: return nil
+        }
+    }
+    private var isTransitioning: Bool { attempt.transitionInFlight }
+    private var isRunning: Bool { ["working", "awaitingPrompt", "cancelling"].contains(state) }
+    private var displayProgress: Double { V3NormalizedProgress.displayValue(progress, state: state) }
+    private var progressPercent: Int { V3NormalizedProgress.percent(progress, state: state) }
+    private var completionAwaitingSettlement: Bool {
+        V3OperationCompletionPolicy.requiresDeviceCheck(state: state,
+            backendSettled: terminalBackendSettled,
+            deviceCheckConfirmed: deviceCheckConfirmedForCompletion,
+            outcomeUnknown: needsDeviceConfirmation)
+    }
     var body: some View {
         NavigationView {
             List {
                 Section {
                     HStack {
-                        if state == "working" || state == "awaitingPrompt" {
-                            ProgressView(value: progress > 0 ? progress : nil)
-                                .frame(maxWidth: .infinity)
-                        } else if state == "completed" {
-                            Label("Completed", systemImage: "checkmark.circle.fill")
-                                .foregroundColor(.green)
-                        }
-                    }
-                    HStack {
                         Text("Status")
                         Spacer()
-                        Text(statusText).foregroundColor(.secondary)
+                        if state == "completed" {
+                            Label("Completed", systemImage: "checkmark.circle.fill")
+                                .foregroundColor(.green)
+                        } else {
+                            Text(statusText).foregroundColor(.secondary)
+                        }
+                    }
+                    if isRunning || state == "completed" {
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text("Progress")
+                                Spacer()
+                                Text(hasProgress || state == "completed" ? "\(progressPercent)%" : "—")
+                                    .foregroundColor(.secondary)
+                            }
+                            ProgressView(value: hasProgress || state == "completed" ? displayProgress : nil)
+                        }
                     }
                 }
                 if let prompt {
-                    V3PromptSection(prompt: prompt) { answer in
+                    V3PromptSection(prompt: prompt, isSubmitting: $promptSubmitting,
+                                    isSubmissionBlocked: promptResponseBlocked) { answer in
                         Task { await answerPrompt(id: prompt["id"] as? String ?? "", answer: answer) }
                     }
                 }
                 if let offer = sourceOffer {
                     Section("Missing Source") {
                         Text("\"\((offer["name"] ?? ""))\" is not added. Add it, then the operation retries automatically.")
-                            .font(.footnote)
-                            .foregroundColor(.secondary)
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
                         Button {
+                            guard !isTransitioning else { return }
                             Task { await addSourceAndRetry(id: offer["id"] ?? "") }
                         } label: {
-                            Label("Add Source and Retry", systemImage: "plus.circle.fill")
+                            Label(sourceAddButtonTitle, systemImage: "plus.circle.fill")
                         }
+                        .disabled(isTransitioning || sourceAddRetryBlocked)
                     }
                 }
                 if !message.isEmpty {
-                    Section("Notice") {
+                    Section("What happened") {
                         Text(message)
                             .font(.footnote)
                             .textSelection(.enabled)
-                        HStack {
-                            Button("Copy Diagnostics") {
-                                UIPasteboard.general.string = message
+                    }
+                    if !whatToDo.isEmpty {
+                        Section("What you can do") {
+                            Text(whatToDo).font(.footnote)
+                            if needsDeviceConfirmation, uncertainSessionID != nil {
+                                Button("Reconcile After Checking Device") {
+                                    confirmUncertainRetirement = true
+                                }
+                            }
+                            if let destination = recoveryDestination,
+                               let action = recoveryActionTitle(for: destination) {
+                                Button(action) { openRecoveryDestination(destination) }
+                            }
+                            if retryAllowed {
+                                Button(isTransitioning ? "Waiting..." : retryButtonTitle) { retry() }
+                                    .buttonStyle(.borderedProminent)
+                                    .disabled(isTransitioning)
+                            }
+                        }
+                    } else if retryAllowed {
+                        Section("What you can do") {
+                            Button(isTransitioning ? "Waiting..." : retryButtonTitle) { retry() }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(isTransitioning)
+                        }
+                    }
+                    if !technicalDetails.isEmpty {
+                        Section {
+                            DisclosureGroup("Technical details") {
+                                Text(technicalDetails)
+                                    .font(.caption2)
+                                    .textSelection(.enabled)
+                            }
+                            Button(copied ? "Copied" : "Copy Diagnostics") {
+                                UIPasteboard.general.string = technicalDetails
+                                copied = true
+                                Task {
+                                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                                    copied = false
+                                }
                             }
                             .font(.caption)
-                            Spacer()
-                            if retryAllowed {
-                                Button("Retry") {
-                                    reset()
-                                    start()
-                                }
-                                .font(.caption)
-                                .buttonStyle(.borderedProminent)
-                            }
                         }
                     }
                 }
@@ -1167,129 +2781,767 @@ struct V3OperationSheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") {
-                        task?.cancel()
-                        cancelSession()
-                        dismiss()
+                    Button(isRunning ? (state == "cancelling" ? "Cancelling..." : "Cancel") :
+                        (completionAwaitingSettlement ? "Reconcile" : "Done")) {
+                        if isRunning {
+                            cancelAttempt()
+                        } else if completionAwaitingSettlement {
+                            confirmUncertainRetirement = true
+                        } else {
+                            acknowledgeAndDismiss()
+                        }
                     }
+                    .disabled(isTransitioning || state == "cancelling")
                 }
             }
         }
         .navigationViewStyle(StackNavigationViewStyle())
-        .task { start() }
-        .onDisappear {
-            task?.cancel()
-            cancelSession()
-            if request.operation == "installSharedIPA" {
-                LCUtils.appGroupUserDefault.removeObject(forKey: "V3SharedIPA." + request.target)
+        .interactiveDismissDisabled(true)
+        .confirmationDialog("Check the device before restarting SideStore?", isPresented: $confirmUncertainRetirement,
+                            titleVisibility: .visible) {
+            Button("I checked; restart SideStore", role: .destructive) {
+                confirmUncertainOperationAfterDeviceCheck()
             }
-            status.reload()
+            Button("Keep Waiting", role: .cancel) {}
+        } message: {
+            Text("Use this only after confirming the device is no longer installing, updating, refreshing, or deleting the app.")
+        }
+        .task {
+            if request.operation == "installSharedIPA" {
+                status.installOperationDidPresent(attemptID: request.installAttemptID,
+                    operationID: request.id)
+            }
+            start()
+        }
+        .onDisappear {
+            if !isDismissing {
+                isDismissing = true
+                let oldTask = task
+                let wasTerminal = attempt.isTerminal
+                let terminalOutcome = wasTerminal &&
+                    ["completed", "failed", "cancelled", "timedOut"].contains(state)
+                    ? state : "cancelled"
+                let mustConfirmCancel = V3OperationCoverDismissalPolicy.mustConfirmBackendStop(
+                    isRunning: isRunning, hasSession: attempt.sessionID != nil,
+                    sessionIsTerminal: wasTerminal,
+                    hasUncertainSession: uncertainSessionID != nil,
+                    transitionInFlight: attempt.transitionInFlight)
+                let oldSession = uncertainSessionID ?? (mustConfirmCancel ? attempt.supersede() : nil)
+                oldTask?.cancel()
+                Task { @MainActor in
+                    var cancellationConfirmed = !mustConfirmCancel
+                    var confirmedOutcome = terminalOutcome
+                    if let oldSession {
+                        do {
+                            let reply = try await V3ServiceBridge.shared.request(operation: "opCancel", target: oldSession)
+                            let terminalState = reply["state"] as? String
+                            cancellationConfirmed = V3OperationTerminalAcceptancePolicy.isSettledTerminal(
+                                state: terminalState,
+                                backendSettled: V3ServiceBridge.strictBool(reply["backendSettled"]),
+                                stopConfirmed: V3ServiceBridge.strictBool(reply["stopConfirmed"]),
+                                outcomeUnknown: V3OperationReplyFieldPolicy.outcomeUnknown(reply["outcomeUnknown"]))
+                            if cancellationConfirmed { confirmedOutcome = terminalState ?? "cancelled" }
+                        } catch { cancellationConfirmed = false }
+                    }
+                    await oldTask?.value
+                    if request.operation == "installSharedIPA", cancellationConfirmed {
+                        status.installTerminal(attemptID: request.installAttemptID,
+                            operationID: request.id, outcome: confirmedOutcome)
+                        let token = request.installAttemptID.flatMap {
+                            status.resetInstallUI(attemptID: $0, outcome: "unexpected_cover_dismissal")
+                        }
+                        if let token { stagedIPACleaned = await status.cleanupStagedIPA(token,
+                            allowLocalFallback: true) }
+                    } else if request.operation == "installSharedIPA", mustConfirmCancel, !cancellationConfirmed {
+                        status.error = "The operation was not confirmed as stopped, so its staged IPA was kept safely. Reconnect before cleanup."
+                    }
+                    status.reload()
+                }
+            }
         }
     }
     private var statusText: String {
         switch state {
+        case "cancelling": return "Cancelling..."
+        case "reconciling": return "Checking result..."
+        case "working" where isTransitioning: return "Waiting for previous attempt..."
         case "completed": return "Completed"
         case "awaitingPrompt": return "Needs your input"
+        case "promptExpired": return "Verification expired"
+        case "timedOut": return "Sign-in timed out"
         case "failed": return "Failed"
         case "cancelled": return "Cancelled"
-        default: return progress > 0 ? "\(Int(progress * 100))%" : "Working..."
+        case "requiresSource": return "Source required"
+        default: return isTransitioning ? "Waiting for previous attempt..." : operationPhase.label
         }
-    }
-    private func reset() {
-        session = nil; state = "working"; progress = 0; prompt = nil; sourceOffer = nil; message = ""
     }
     private func start() {
-        guard !started else { return }
-        started = true
-        task = Task { await run() }
+        guard startedGeneration == nil, !attempt.transitionInFlight else { return }
+        startAttempt(generation: attempt.begin())
     }
-    private func run() async {
+    private func startAttempt(generation: UUID) {
+        guard attempt.generation == generation, startedGeneration != generation else { return }
+        startedGeneration = generation
+        userRequestedCancellation = false
+        progress = 0
+        hasProgress = false
+        operationPhase = .working
+        task = Task { await run(generation: generation) }
+    }
+    private func run(generation: UUID) async {
+        var backendSessionStarted = false
         do {
+            status.installBackendStartRequested(attemptID: request.installAttemptID,
+                operationID: request.id, sessionID: generation.uuidString)
             let reply = try await V3ServiceBridge.shared.request(operation: "opStart",
-                payload: ["kind": request.operation, "target": request.target])
-            guard let id = reply["session"] as? String else {
-                throw NSError(domain: "V3Operation", code: 1,
-                              userInfo: [NSLocalizedDescriptionKey: "The service did not start the operation."])
+                payload: ["kind": request.operation, "target": request.target,
+                          "session": generation.uuidString])
+            if reply["failedToStart"] as? Bool == true {
+                handleStartFailure(reply, generation: generation)
+                return
             }
-            session = id
-            try await pollLoop(id: id)
+            guard let id = reply["session"] as? String else {
+                if reply["state"] as? String == "failed" {
+                    handleStartFailure(reply, generation: generation)
+                } else {
+                    let failure = CombinedFailure(operation: request.operation, stage: .command,
+                        code: .invalidResponse, id: generation.uuidString, retryable: false)
+                    failureContext.recordStartFailure(failure)
+                    presentCurrentFailure()
+                }
+                return
+            }
+            guard id == generation.uuidString else {
+                _ = try? await V3ServiceBridge.shared.request(operation: "opCancel", target: id)
+                let failure = CombinedFailure(operation: request.operation, stage: .command,
+                    code: .staleResult, id: generation.uuidString, retryable: false)
+                failureContext.recordStartFailure(failure)
+                presentCurrentFailure()
+                return
+            }
+            guard attempt.bind(sessionID: id, generation: generation) else {
+                _ = try? await V3ServiceBridge.shared.request(operation: "opCancel", target: id)
+                return
+            }
+            backendSessionStarted = true
+            status.installBackendStarted(attemptID: request.installAttemptID,
+                operationID: request.id, sessionID: id)
+            failureContext.operationStarted()
+            retryBlocked = false
+            try await pollLoop(id: id, generation: generation)
         } catch {
-            state = "failed"
-            message = error.localizedDescription
-            recordRefresh("failed", message)
+            guard attempt.generation == generation, !attempt.isTerminal else { return }
+            if error is CancellationError, attempt.transitionInFlight { return }
+            let failure = (error as? CombinedFailure) ?? CombinedFailure.capture(error,
+                operation: request.operation,
+                stage: backendSessionStarted ? .xpcConnection : .command,
+                id: generation.uuidString)
+            if backendSessionStarted {
+                failureContext.recordPipelineFailure(failure)
+            } else {
+                failureContext.recordStartFailure(failure)
+            }
+            presentCurrentFailure()
+            if V3ServiceBridge.shared.hasUncertainOperationSession(generation.uuidString) {
+                needsDeviceConfirmation = true
+                uncertainSessionID = generation.uuidString
+                retryBlocked = true
+                message = "SideStore could not confirm the current operation result."
+                whatToDo = "Check the device before starting another mutation. If no operation is running, use Reconcile After Checking Device."
+                technicalDetails += " backend_settled=no outcome=unknown"
+            }
         }
     }
-    private func pollLoop(id: String) async throws {
+
+    private func handleStartFailure(_ reply: [String: Any], generation: UUID) {
+        guard attempt.generation == generation, !attempt.isTerminal else { return }
+        let failure = (reply["failure"] as? [String: Any]).flatMap {
+            CombinedFailure.decode($0, expectedID: generation.uuidString)
+        } ?? CombinedFailure(operation: request.operation,
+            stage: CombinedFailure.Stage(rawValue: reply["stage"] as? String ?? "") ?? .command,
+            code: CombinedFailure.Code(rawValue: reply["code"] as? String ?? "") ?? .failed,
+            id: generation.uuidString, retryable: reply["retryable"] as? Bool)
+        failureContext.recordStartFailure(failure)
+        presentCurrentFailure()
+    }
+
+    private func presentCurrentFailure() {
+        _ = attempt.acceptStartFailure(generation: attempt.generation)
+        status.installTerminal(attemptID: request.installAttemptID,
+            operationID: request.id, outcome: "failed")
+        state = "failed"
+        message = failureContext.whatHappened
+        whatToDo = failureContext.whatToDo
+        technicalDetails = failureContext.technicalDetails
+        recoveryDestination = failureContext.currentFailure?.recoveryDestination
+        recordRefresh("failed", message)
+    }
+    private func confirmUncertainOperationAfterDeviceCheck() {
+        guard let sessionID = uncertainSessionID else { return }
+        guard V3ServiceBridge.shared.confirmUncertainOperationAfterDeviceCheck(sessionID: sessionID) else {
+            uncertainSessionID = nil
+            needsDeviceConfirmation = false
+            terminalBackendSettled = true
+            retryBlocked = true
+            if state == "completed" {
+                terminalBackendSettled = true
+                deviceCheckConfirmedForCompletion = true
+                message = request.operation == "delete"
+                    ? "The app removal is verified and SideStore has finished the operation cleanup."
+                    : request.title + " completed successfully."
+                whatToDo = "Reload app status to confirm the result."
+            } else {
+                message = "The operation has settled. Reload app status before starting another mutation."
+                whatToDo = "Check the installed app list and verify the result."
+            }
+            finishReconciliationAfterRetirement()
+            status.reload()
+            return
+        }
+        uncertainSessionID = nil
+        needsDeviceConfirmation = false
+        terminalBackendSettled = true
+        retryBlocked = true
+        deviceCheckConfirmedForCompletion = state == "completed"
+        finishReconciliationAfterRetirement()
+        status.reload()
+        if state == "completed" {
+            message = "The app removal was verified. SideStore was restarted to clear a delete callback that did not settle."
+            whatToDo = "Reload app status to confirm the app remains absent, then tap Done."
+            technicalDetails += " service_retired_after_user_confirmation=yes delete_verified=yes"
+        } else {
+            message = "SideStore restarted after your device check. The previous operation result remains unknown."
+            whatToDo = "Wait for app status to reload, then verify the installed app before starting another operation."
+            technicalDetails += " service_retired_after_user_confirmation=yes outcome=unknown"
+        }
+    }
+    private func finishReconciliationAfterRetirement() {
+        guard state == "reconciling", let sessionID = attempt.sessionID else { return }
+        _ = attempt.accept(state: "failed", generation: attempt.generation, sessionID: sessionID)
+        state = "failed"
+        status.installTerminal(attemptID: request.installAttemptID,
+            operationID: request.id, outcome: "unknown")
+    }
+    private func pollLoop(id: String, generation: UUID) async throws {
+        var settlementRetryDelay: TimeInterval?
         while !Task.isCancelled {
-            try await Task.sleep(nanoseconds: 1_000_000_000)
+            let interval = settlementRetryDelay ?? V3OperationCompletionPolicy.pollInterval(
+                state: state, backendSettled: terminalBackendSettled,
+                outcomeUnknown: needsDeviceConfirmation)
+            settlementRetryDelay = nil
+            try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
             try Task.checkCancellation()
-            let reply = try await V3ServiceBridge.shared.request(operation: "opPoll", target: id)
-            apply(reply)
-            guard let current = reply["state"] as? String,
-                  current == "working" || current == "awaitingPrompt" else { return }
+            guard attempt.owns(generation: generation, sessionID: id),
+                  !attempt.isTerminal || completionAwaitingSettlement else { return }
+            let reply: [String: Any]
+            do {
+                reply = try await V3ServiceBridge.shared.request(operation: "opPoll", target: id)
+            } catch {
+                guard attempt.owns(generation: generation, sessionID: id),
+                      V3OperationCompletionPolicy.shouldRetrySettlementPollFailure(
+                        state: state, backendSettled: terminalBackendSettled,
+                        outcomeUnknown: needsDeviceConfirmation,
+                        cancellationRequested: userRequestedCancellation),
+                      !Task.isCancelled else { throw error }
+                settlementRetryDelay = V3OperationCompletionPolicy.nextSettlementPollRetryDelay(
+                    current: interval)
+                NSLog("[V3_OPERATION_UI] settlement_poll_retry session=%@ delay=%.0f",
+                      id, settlementRetryDelay ?? 0)
+                continue
+            }
+            settlementRetryDelay = nil
+            guard let current = reply["state"] as? String else {
+                throw NSError(domain: "V3Operation", code: 2,
+                              userInfo: [NSLocalizedDescriptionKey: "The service returned an unreadable operation state."])
+            }
+            guard reply["session"] as? String == id else { return }
+            apply(reply, generation: generation, sessionID: id)
+            if V3OperationCompletionPolicy.shouldContinuePolling(state: current,
+                backendSettled: V3ServiceBridge.strictBool(reply["backendSettled"]),
+                outcomeUnknown: V3OperationReplyFieldPolicy.outcomeUnknown(reply["outcomeUnknown"])) {
+                continue
+            }
+            guard current == "working" || current == "awaitingPrompt" || current == "cancelling" ||
+                    current == "reconciling" else { return }
         }
     }
-    private func apply(_ reply: [String: Any]) {
-        state = reply["state"] as? String ?? state
-        progress = reply["progress"] as? Double ?? progress
-        prompt = reply["prompt"] as? [String: Any]
+    private func apply(_ reply: [String: Any], generation: UUID, sessionID: String) {
+        guard let nextState = reply["state"] as? String else { return }
+        guard V3OperationCancellationReplyPolicy.shouldApplyPollState(
+            userRequestedCancellation: userRequestedCancellation, nextState: nextState) else { return }
+        if nextState == "completed", state == "completed",
+           attempt.owns(generation: generation, sessionID: sessionID) {
+            let wasAwaitingSettlement = completionAwaitingSettlement
+            applyCompletionSettlement(reply, sessionID: sessionID)
+            if wasAwaitingSettlement && !completionAwaitingSettlement { status.reload() }
+            return
+        }
+        let replyBackendSettled = V3ServiceBridge.strictBool(reply["backendSettled"])
+        let replyOutcomeUnknown = V3OperationReplyFieldPolicy.outcomeUnknown(reply["outcomeUnknown"])
+        let resolvesProvisionalUnknown = attempt.ownsProvisionalResolution(
+            generation: generation, sessionID: sessionID, currentState: state,
+            currentBackendSettled: terminalBackendSettled,
+            currentOutcomeUnknown: needsDeviceConfirmation, nextState: nextState,
+            nextBackendSettled: replyBackendSettled, nextOutcomeUnknown: replyOutcomeUnknown,
+            nextOperation: reply["operation"] as? String,
+            verifiedDeleteCompletion: V3OperationReplyFieldPolicy.strictBoolean(
+                reply["verifiedDeleteCompletion"]) == true)
+        guard resolvesProvisionalUnknown ||
+              attempt.accept(state: nextState, generation: generation, sessionID: sessionID) else { return }
+        state = nextState
+        if !["working", "awaitingPrompt", "cancelling", "reconciling"].contains(nextState) {
+            status.installTerminal(attemptID: request.installAttemptID,
+                operationID: request.id, outcome: nextState)
+        }
+        if let rawProgress = reply["progress"] as? Double {
+            progress = V3NormalizedProgress.clamp(rawProgress)
+            hasProgress = true
+        }
+        if let rawPhase = reply["phase"] as? String {
+            operationPhase = V3OperationPhase(rawValue: rawPhase) ?? .working
+        }
+        let oldPromptID = prompt?["id"] as? String
+        let nextPrompt = reply["prompt"] as? [String: Any]
+        prompt = nextPrompt
+        if oldPromptID != (nextPrompt?["id"] as? String) { promptSubmitting = false }
+        if oldPromptID != (nextPrompt?["id"] as? String) { promptResponseBlocked = false }
         switch state {
         case "completed":
+            progress = 1
+            hasProgress = true
+            // Terminal success stays visible until the user presses Done.
+            // Auto-dismissing here made successful fast operations look like
+            // nothing happened.
+            applyCompletionSettlement(reply, sessionID: sessionID)
             recordRefresh("completed", "The operation completed. Reload the app list to confirm the result.")
             status.reload()
-            dismiss()
         case "cancelled":
-            dismiss()
+            // Keep cancellation visible and distinguish the user's Cancel
+            // action from a backend cancellation that arrived independently.
+            terminalBackendSettled = V3ServiceBridge.strictBool(reply["backendSettled"])
+            let outcomeUnknown = V3OperationCancellationResolutionPolicy.requiresReconciliation(
+                backendSettled: terminalBackendSettled,
+                outcomeUnknown: V3OperationReplyFieldPolicy.outcomeUnknown(reply["outcomeUnknown"]))
+            needsDeviceConfirmation = outcomeUnknown
+            uncertainSessionID = outcomeUnknown ? sessionID : nil
+            retryBlocked = outcomeUnknown
+            recoveryDestination = nil
+            if outcomeUnknown {
+                message = request.operation == "delete"
+                    ? "SideStore has not confirmed that the app was removed or that deletion stopped."
+                    : "SideStore has not confirmed that the device operation stopped."
+                whatToDo = "Keep this screen open while SideStore reconciles the result. Do not start another operation yet."
+                technicalDetails = "backend_settled=no outcome=unknown"
+            } else {
+                let cancellation = V3OperationCancellationPresentationPolicy.resolve(
+                    userRequested: userRequestedCancellation)
+                message = cancellation.message
+                whatToDo = cancellation.whatToDo
+                technicalDetails = ""
+                recoveryDestination = nil
+                deviceCheckConfirmedForCompletion = false
+            }
         case "waitingForAuthentication":
             status.signInPresented = true
             message = "Sign in first, then run this action again."
+            whatToDo = "Open Account & Signing, complete sign-in, then start a new operation."
+            recoveryDestination = "signIn"
+            retryBlocked = true
         case "requiresSource":
             sourceOffer = ["id": reply["sourceID"] as? String ?? "",
                            "name": reply["sourceName"] as? String ?? "Unknown source"]
             prompt = nil
-        case "failed":
-            var detail = "The operation failed."
-            if let stage = reply["stage"] as? String, let code = reply["code"] as? String {
-                detail += " (\(stage): \(code))"
+        case "reconciling":
+            let failure = (reply["failure"] as? [String: Any]).flatMap {
+                CombinedFailure.decode($0, expectedID: sessionID)
             }
-            message = detail
-            recordRefresh("failed", detail)
+            if let failure { failureContext.recordPipelineFailure(failure) }
+            terminalBackendSettled = V3ServiceBridge.strictBool(reply["backendSettled"])
+            needsDeviceConfirmation = true
+            uncertainSessionID = sessionID
+            retryBlocked = true
+            message = "SideStore is still checking whether the app was removed."
+            whatToDo = "Keep this screen open while SideStore waits for the delete callback. Do not retry until the result is confirmed."
+            technicalDetails = (failure?.technicalDetails ??
+                "schema=1 operation=delete stage=command code=timedOut correlation=\(sessionID) underlying_domain=redacted underlying_code=redacted retryable=unknown") +
+                " backend_settled=no outcome=unknown"
+            recoveryDestination = nil
+        case "failed":
+            let failure = (reply["failure"] as? [String: Any]).flatMap {
+                CombinedFailure.decode($0, expectedID: sessionID)
+            } ?? CombinedFailure(operation: request.operation,
+                stage: CombinedFailure.Stage(rawValue: reply["stage"] as? String ?? "") ?? .command,
+                code: CombinedFailure.Code(rawValue: reply["code"] as? String ?? "") ?? .failed,
+                id: sessionID, retryable: reply["retryable"] as? Bool)
+            failureContext.recordPipelineFailure(failure)
+            let backendSettled = V3ServiceBridge.strictBool(reply["backendSettled"])
+            terminalBackendSettled = backendSettled
+            let outcomeUnknown = V3OperationReplyFieldPolicy.outcomeUnknown(reply["outcomeUnknown"]) ||
+                backendSettled != true
+            needsDeviceConfirmation = outcomeUnknown
+            uncertainSessionID = outcomeUnknown ? sessionID : nil
+            retryBlocked = !V3OperationRetrySafetyPolicy.canRetry(
+                backendSettled: backendSettled,
+                outcomeUnknown: outcomeUnknown)
+            message = failureContext.whatHappened
+            whatToDo = outcomeUnknown
+                ? "The backend has not confirmed that the operation stopped. Do not retry yet; wait for status reconciliation and reload before starting another mutation."
+                : failureContext.whatToDo
+            technicalDetails = failureContext.technicalDetails +
+                (outcomeUnknown ? " backend_settled=no outcome=unknown" : "")
+            recoveryDestination = failureContext.currentFailure?.recoveryDestination
+            if !outcomeUnknown { recordRefresh("failed", message) }
         default: break
         }
     }
+    private func applyCompletionSettlement(_ reply: [String: Any], sessionID: String) {
+        terminalBackendSettled = V3ServiceBridge.strictBool(reply["backendSettled"])
+        let outcomeUnknown = V3OperationReplyFieldPolicy.outcomeUnknown(reply["outcomeUnknown"])
+        switch V3OperationCompletionPolicy.disposition(state: "completed",
+            backendSettled: terminalBackendSettled, outcomeUnknown: outcomeUnknown) {
+        case .completedAwaitingBackendSettlement, .outcomeUnknownAwaitingBackendSettlement:
+            needsDeviceConfirmation = true
+            uncertainSessionID = sessionID
+            retryBlocked = true
+            message = request.operation == "delete"
+                ? "The app was removed from the device, but SideStore is still waiting for the delete callback to settle."
+                : request.title + " completed, but SideStore has not confirmed that its backend session settled."
+            whatToDo = "Keep this screen open while SideStore finishes cleanup. If it remains here, check the device, then use Reconcile After Checking Device before starting another mutation."
+            technicalDetails = "backend_settled=no outcome=verified_completion_pending_callback"
+            recoveryDestination = nil
+        case .completed:
+            needsDeviceConfirmation = false
+            uncertainSessionID = nil
+            deviceCheckConfirmedForCompletion = false
+            retryBlocked = false
+            message = request.title + " completed successfully."
+            whatToDo = "Reload app status to confirm the installed app and signing state."
+            technicalDetails = ""
+            recoveryDestination = nil
+            failureContext.reset()
+        case .notCompleted:
+            break
+        }
+    }
     private func answerPrompt(id: String, answer: [String: String]) async {
-        guard let session else { return }
+        guard !id.isEmpty, let session = attempt.sessionID else { return }
+        let generation = attempt.generation
         do {
             let reply = try await V3ServiceBridge.shared.request(operation: "opAnswer", target: session,
                 payload: ["prompt": id, "answer": answer])
-            apply(reply)
+            guard attempt.matches(generation: generation, sessionID: session),
+                  reply["session"] as? String == session else { return }
+            if V3ServiceBridge.strictBool(reply["responsePending"]) == true {
+                guard prompt?["id"] as? String == id else { return }
+                promptSubmitting = true
+                message = "Your response is being processed..."
+                return
+            }
+            apply(reply, generation: generation, sessionID: session)
         } catch {
-            state = "failed"
-            message = error.localizedDescription
+            guard attempt.matches(generation: generation, sessionID: session) else { return }
+            promptSubmitting = false
+            let failure = (error as? CombinedFailure) ?? CombinedFailure.capture(error,
+                operation: request.operation, stage: .command, id: session)
+            let promptFailure = V3OperationPromptFailureDetails(failure)
+            message = promptFailure.failure.whatHappened
+            whatToDo = promptFailure.failure.recommendedAction
+            technicalDetails = promptFailure.failure.technical
+            recoveryDestination = promptFailure.failure.recoveryDestination
+            promptResponseBlocked = promptFailure.blocksResubmission
         }
     }
     private func addSourceAndRetry(id: String) async {
-        guard !id.isEmpty else { return }
+        guard !id.isEmpty, attempt.beginTransition() else { return }
         do {
             let preview = try await V3ServiceBridge.shared.request(operation: "sourcePreview", target: id)
             _ = try await V3ServiceBridge.shared.request(operation: "sourceAddConfirmed",
                 target: preview["identifier"] as? String ?? id)
-            sourceOffer = nil
+            sourceAddFailure = nil
+            sourceAddRetryBlocked = false
+            retryBlocked = false
             status.reload()
-            reset()
-            started = false
-            start()
+            attempt.endTransition()
+            retry()
         } catch {
-            message = error.localizedDescription
+            attempt.endTransition()
+            let failure = (error as? CombinedFailure) ?? CombinedFailure.capture(error,
+                operation: "source", stage: .source,
+                id: attempt.sessionID ?? UUID().uuidString)
+            let details = V3OperationFailureDetails(failure)
+            sourceAddFailure = details
+            sourceAddRetryBlocked = details.retryDisposition == .blocked ||
+                details.retryDisposition == .prerequisite
+            retryBlocked = true
+            message = details.whatHappened
+            whatToDo = details.recommendedAction
+            technicalDetails = details.technical
+            recoveryDestination = details.recoveryDestination
         }
     }
-    private func cancelSession() {
-        if let session {
-            Task {
-                _ = try? await V3ServiceBridge.shared.request(operation: "opCancel", target: session)
+    private func retry() {
+        guard retryAllowed, attempt.beginTransition() else { return }
+        let oldTask = task
+        let oldSession = attempt.supersede()
+        let transitionGeneration = attempt.generation
+        uncertainSessionID = oldSession
+        startedGeneration = nil
+        promptSubmitting = false
+        prompt = nil
+        sourceOffer = nil
+        progress = 0
+        message = "Waiting for the previous attempt to stop..."
+        whatToDo = "The new attempt will start after the service confirms that the prior session stopped."
+        technicalDetails = failureContext.technicalDetails
+        recoveryDestination = nil
+        retryBlocked = false
+        promptResponseBlocked = false
+        sourceAddFailure = nil
+        sourceAddRetryBlocked = false
+        state = "working"
+        Task { @MainActor in
+            oldTask?.cancel()
+            do {
+                if let oldSession {
+                    let reply = try await V3ServiceBridge.shared.request(operation: "opCancel", target: oldSession)
+                    let disposition = V3OperationRetrySafetyPolicy.disposition(
+                        state: reply["state"] as? String,
+                        backendSettled: V3ServiceBridge.strictBool(reply["backendSettled"])
+                            ?? V3ServiceBridge.strictBool(reply["stopConfirmed"]),
+                        outcomeUnknown: V3OperationReplyFieldPolicy.outcomeUnknown(reply["outcomeUnknown"]))
+                    if disposition == .alreadyCompleted {
+                        await oldTask?.value
+                        guard attempt.transitionInFlight, attempt.generation == transitionGeneration else { return }
+                        attempt.endTransition()
+                        uncertainSessionID = nil
+                        needsDeviceConfirmation = false
+                        retryBlocked = true
+                        state = "completed"
+                        progress = 1
+                        hasProgress = true
+                        message = request.title + " completed successfully."
+                        whatToDo = "Reload app status to confirm the installed app and signing state."
+                        technicalDetails = ""
+                        failureContext.reset()
+                        status.installTerminal(attemptID: request.installAttemptID,
+                            operationID: request.id, outcome: "completed")
+                        status.reload()
+                        recordRefresh("completed", message)
+                        V3ServiceBridge.shared.forgetSettledOperationSession(oldSession)
+                        return
+                    }
+                    if disposition != .retry {
+                        await oldTask?.value
+                        guard attempt.transitionInFlight, attempt.generation == transitionGeneration else { return }
+                        let failure = CombinedFailure(operation: request.operation, stage: .command,
+                            code: .timedOut, id: transitionGeneration.uuidString)
+                        failureContext.recordStartFailure(failure)
+                        attempt.endTransition()
+                        retryBlocked = true
+                        needsDeviceConfirmation = true
+                        uncertainSessionID = oldSession
+                        state = "failed"
+                        message = failureContext.whatHappened
+                        whatToDo = "The previous operation has not settled. Check the device; do not start another mutation until the result is reconciled."
+                        technicalDetails = failureContext.technicalDetails + " backend_settled=no outcome=unknown"
+                        return
+                    }
+                    V3ServiceBridge.shared.forgetSettledOperationSession(oldSession)
+                }
+                await oldTask?.value
+                guard attempt.transitionInFlight, attempt.generation == transitionGeneration else { return }
+                uncertainSessionID = nil
+                status.prepareInstallRetry(attemptID: request.installAttemptID)
+                failureContext.beginRetry()
+                message = ""
+                let generation = attempt.begin()
+                attempt.endTransition()
+                startAttempt(generation: generation)
+            } catch {
+                await oldTask?.value
+                guard attempt.generation == transitionGeneration else { return }
+                attempt.endTransition()
+                let failure = (error as? CombinedFailure) ?? CombinedFailure.capture(error,
+                    operation: request.operation, stage: .xpcConnection,
+                    id: transitionGeneration.uuidString)
+                failureContext.recordStartFailure(failure)
+                retryBlocked = true
+                needsDeviceConfirmation = oldSession != nil
+                if oldSession != nil { uncertainSessionID = oldSession }
+                presentCurrentFailure()
             }
         }
-        session = nil
+    }
+    private func cancelAttempt() {
+        guard isRunning, state != "cancelling", attempt.beginTransition() else { return }
+        let keepDeletePoller = V3DeleteCancellationPolicy.keepsHostPollMonitor(
+            operation: request.operation)
+        userRequestedCancellation = true
+        state = "cancelling"
+        message = ""
+        let oldTask = task
+        let transitionGeneration = attempt.generation
+        let oldSession = attempt.sessionID ?? transitionGeneration.uuidString
+        uncertainSessionID = oldSession
+        startedGeneration = nil
+        prompt = nil
+        Task { @MainActor in
+            if !keepDeletePoller { oldTask?.cancel() }
+            do {
+                let reply = try await V3ServiceBridge.shared.request(operation: "opCancel", target: oldSession)
+                if !keepDeletePoller { await oldTask?.value }
+                guard attempt.generation == transitionGeneration else { return }
+                if attempt.sessionID == nil {
+                    _ = attempt.bind(sessionID: oldSession, generation: transitionGeneration)
+                }
+                let settledCancellationAcknowledgement = V3OperationCancellationOutcomePolicy.terminalState(
+                    expectedSessionID: oldSession,
+                    replySessionID: reply["session"] as? String,
+                    state: reply["state"] as? String,
+                    backendSettled: V3ServiceBridge.strictBool(reply["backendSettled"]),
+                    stopConfirmed: V3ServiceBridge.strictBool(reply["stopConfirmed"]),
+                    outcomeUnknown: V3OperationReplyFieldPolicy.outcomeUnknown(reply["outcomeUnknown"]))
+                let cancellationReplyIsCorrelated = V3OperationCancellationOutcomePolicy.isCorrelated(
+                    expectedSessionID: oldSession, replySessionID: reply["session"] as? String)
+                if (keepDeletePoller && settledCancellationAcknowledgement != nil) ||
+                   (!keepDeletePoller && cancellationReplyIsCorrelated) {
+                    apply(reply, generation: transitionGeneration, sessionID: oldSession)
+                    if let settledCancellationAcknowledgement {
+                        if V3OperationCancellationOutcomePolicy.shouldClearSessionHandle(
+                            currentSessionID: uncertainSessionID, expectedSessionID: oldSession,
+                            replySessionID: reply["session"] as? String,
+                            state: reply["state"] as? String,
+                            backendSettled: V3ServiceBridge.strictBool(reply["backendSettled"]),
+                            stopConfirmed: V3ServiceBridge.strictBool(reply["stopConfirmed"]),
+                            outcomeUnknown: V3OperationReplyFieldPolicy.outcomeUnknown(reply["outcomeUnknown"])) {
+                            // A delayed unsettled acknowledgment cannot discard
+                            // the handle established by a newer delete poll.
+                            state = settledCancellationAcknowledgement
+                            terminalBackendSettled = true
+                            needsDeviceConfirmation = false
+                            uncertainSessionID = nil
+                        }
+                    }
+                } else if !keepDeletePoller {
+                    state = "failed"
+                    needsDeviceConfirmation = true
+                    uncertainSessionID = oldSession
+                    retryBlocked = true
+                    message = "SideStore could not confirm that this operation stopped."
+                    whatToDo = "Reload operation status before starting another mutation."
+                    technicalDetails = "operation_session_response_mismatch=yes backend_settled=no"
+                }
+                if keepDeletePoller && state == "cancelling" {
+                    message = "Cancellation was requested. SideStore is waiting for the delete result."
+                    whatToDo = "Keep this screen open. Do not start another operation until the delete result is confirmed."
+                    retryBlocked = true
+                } else if ["working", "cancelling"].contains(state) {
+                    state = "reconciling"
+                    terminalBackendSettled = false
+                    needsDeviceConfirmation = true
+                    uncertainSessionID = oldSession
+                    retryBlocked = true
+                    message = "SideStore has not confirmed that the operation stopped."
+                    whatToDo = "Reload operation status before starting another mutation."
+                    technicalDetails = "backend_settled=no outcome=unknown"
+                }
+            } catch {
+                if !keepDeletePoller { await oldTask?.value }
+                guard attempt.generation == transitionGeneration else { return }
+                state = "failed"
+                let failure = (error as? CombinedFailure) ?? CombinedFailure.capture(error,
+                    operation: request.operation, stage: .xpcConnection,
+                    id: transitionGeneration.uuidString)
+                failureContext.recordPipelineFailure(failure)
+                retryBlocked = true
+                needsDeviceConfirmation = true
+                uncertainSessionID = oldSession
+                message = "SideStore could not confirm that the operation stopped. It may still be running."
+                whatToDo = "Reconnect and reload operation status before trying another mutation."
+                technicalDetails = failure.technicalDetails
+            }
+            attempt.endTransition()
+        }
+    }
+    private func acknowledgeAndDismiss() {
+        guard V3OperationCompletionPolicy.mayDismiss(state: state,
+            backendSettled: terminalBackendSettled,
+            deviceCheckConfirmed: deviceCheckConfirmedForCompletion) else {
+            confirmUncertainRetirement = true
+            return
+        }
+        guard attempt.beginTransition() else { return }
+        isDismissing = true
+        let oldTask = task
+        let oldSession = attempt.supersede()
+        oldTask?.cancel()
+        Task { @MainActor in
+            await oldTask?.value
+            let cancellationTarget = uncertainSessionID ?? oldSession
+            var confirmedOutcome = "cancelled"
+            if let cancellationTarget {
+                do {
+                    let reply = try await V3ServiceBridge.shared.request(operation: "opCancel", target: cancellationTarget)
+                    let backendSettled = V3OperationTerminalAcceptancePolicy.isSettledTerminal(
+                        state: reply["state"] as? String,
+                        backendSettled: V3ServiceBridge.strictBool(reply["backendSettled"]),
+                        stopConfirmed: V3ServiceBridge.strictBool(reply["stopConfirmed"]),
+                        outcomeUnknown: V3OperationReplyFieldPolicy.outcomeUnknown(reply["outcomeUnknown"]))
+                    guard backendSettled else {
+                        isDismissing = false
+                        attempt.endTransition()
+                        needsDeviceConfirmation = true
+                        uncertainSessionID = cancellationTarget
+                        retryBlocked = true
+                        message = "SideStore has not confirmed that the operation stopped."
+                        whatToDo = "Check the device. If no operation is still running, use Reconcile After Checking Device."
+                        return
+                    }
+                    uncertainSessionID = nil
+                    if ["completed", "failed", "cancelled", "requiresSource", "waitingForAuthentication"]
+                        .contains(reply["state"] as? String ?? "") {
+                        V3ServiceBridge.shared.forgetSettledOperationSession(cancellationTarget)
+                    }
+                    if reply["state"] as? String == "completed" {
+                        confirmedOutcome = "completed"
+                        state = "completed"
+                        progress = 1
+                        hasProgress = true
+                        message = request.title + " completed successfully."
+                        whatToDo = "Reload app status to confirm the installed app and signing state."
+                        recordRefresh("completed", message)
+                    } else if reply["state"] as? String == "failed" {
+                        confirmedOutcome = "failed"
+                    }
+                } catch {
+                    if uncertainSessionID != nil {
+                        isDismissing = false
+                        attempt.endTransition()
+                        retryBlocked = true
+                        message = "SideStore could not confirm that the previous operation stopped. The staged IPA was kept safely."
+                        whatToDo = "Reconnect before retrying or cleaning up the selected IPA."
+                        return
+                    }
+                }
+            }
+            status.installTerminal(attemptID: request.installAttemptID,
+                operationID: request.id, outcome: confirmedOutcome)
+            if request.operation == "installSharedIPA" {
+                let token = request.installAttemptID.flatMap {
+                    status.resetInstallUI(attemptID: $0, outcome: "acknowledged",
+                        preserveRecoveryDestination: status.operationRecoveryDestination != nil)
+                }
+                if let token, !stagedIPACleaned {
+                    stagedIPACleaned = await status.cleanupStagedIPA(token, allowLocalFallback: true)
+                }
+            }
+            status.reload()
+            dismiss()
+        }
+    }
+    private func openRecoveryDestination(_ destination: String) {
+        status.operationRecoveryDestination = destination
+        acknowledgeAndDismiss()
     }
     private func recordRefresh(_ result: String, _ detail: String) {
         guard request.operation == "refreshApp" else { return }
@@ -1300,9 +3552,12 @@ struct V3OperationSheet: View {
 
 struct V3PromptSection: View {
     let prompt: [String: Any]
+    @Binding var isSubmitting: Bool
+    var isSubmissionBlocked = false
     let onAnswer: ([String: String]) -> Void
     @State private var fields: [String: String] = [:]
     @State private var selected: Set<String> = []
+    @State private var copiedDetails = false
     private var kind: String { prompt["kind"] as? String ?? "" }
     private var title: String { prompt["title"] as? String ?? "Input Needed" }
     private var message: String { prompt["message"] as? String ?? "" }
@@ -1327,6 +3582,10 @@ struct V3PromptSection: View {
     private var phoneOptions: [[String: String]] {
         options.filter { ($0["id"] ?? "").hasPrefix("phone:") }
     }
+    private var twoFactorStep: V3TwoFactorStep {
+        let raw = fieldDefs.first(where: { $0["key"] == "step" })?["value"] ?? "chooseDeliveryMethod"
+        return V3TwoFactorStep(rawValue: raw) ?? .chooseDeliveryMethod
+    }
     var body: some View {
         Section(title) {
             if !message.isEmpty {
@@ -1335,64 +3594,62 @@ struct V3PromptSection: View {
                     .foregroundColor(.secondary)
             }
             if kind == "twoFactor" {
-                Text("Step 1 - Choose how Apple sends your code:")
-                    .font(.subheadline.weight(.semibold))
-                ForEach(deliveryOptions, id: \.self) { option in
-                    Button {
+                switch twoFactorStep {
+                case .chooseDeliveryMethod:
+                    Text("Choose how Apple sends your verification code.")
+                        .font(.subheadline.weight(.semibold))
+                    ForEach(deliveryOptions, id: \.self) { option in twoFactorOption(option) }
+                    twoFactorCancelButton()
+                case .choosePhoneNumber:
+                    Text("Choose the phone number for this request.")
+                        .font(.subheadline.weight(.semibold))
+                    ForEach(phoneOptions, id: \.self) { option in twoFactorOption(option) }
+                    twoFactorCancelButton()
+                case .enterVerificationCode:
+                    TextField("Verification code", text: binding("code"))
+                        .keyboardType(.numberPad)
+                        .textFieldStyle(.roundedBorder)
+                        .textContentType(.oneTimeCode)
+                    Button("Verify Code") {
                         var answer = fields
-                        answer["choice"] = option["id"] ?? ""
-                        answer["action"] = option["id"] ?? ""
-                        onAnswer(answer)
-                    } label: {
-                        HStack {
-                            Text(option["label"] ?? "")
-                            Spacer()
-                            Image(systemName: "chevron.right")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
+                        answer["choice"] = "code"
+                        answer["action"] = "code"
+                        respond(answer)
                     }
-                    .buttonStyle(.bordered)
-                }
-                ForEach(phoneOptions, id: \.self) { option in
-                    Button {
+                    .buttonStyle(.borderedProminent)
+                    .disabled((fields["code"] ?? "").isEmpty || isSubmitting || isSubmissionBlocked)
+                    Button("Change Verification Method", systemImage: "arrow.uturn.backward") {
                         var answer = fields
-                        let phoneID = String((option["id"] ?? "").dropFirst("phone:".count))
-                        answer["phoneID"] = phoneID
-                        let delivery = fields["mode"] == "voice" ? "voice" : "sms"
-                        answer["choice"] = delivery
-                        answer["action"] = delivery
-                        onAnswer(answer)
-                    } label: {
-                        HStack {
-                            Image(systemName: "phone.fill")
-                                .foregroundColor(.accentColor)
-                            Text(option["label"] ?? "")
-                            Spacer()
-                        }
+                        answer["action"] = "changeMethod"
+                        answer["choice"] = "changeMethod"
+                        respond(answer)
                     }
-                }
-                Text("Step 2 - Enter the code you received:")
-                    .font(.subheadline.weight(.semibold))
-                    .padding(.top, 4)
-                TextField("6-digit code", text: binding("code"))
-                    .keyboardType(.numberPad)
-                    .textFieldStyle(.roundedBorder)
-                Button("Submit Code") {
-                    var answer = fields
-                    answer["choice"] = "code"
-                    answer["action"] = "code"
-                    onAnswer(answer)
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled((fields["code"] ?? "").isEmpty)
-                Button("Cancel Sign In", role: .cancel) {
-                    onAnswer(["action": "cancel", "choice": "cancel"])
+                    .disabled(isSubmitting)
+                    twoFactorCancelButton()
+                case .verifyingCode:
+                    ProgressView("Verifying code...")
+                case .deliveryRequested:
+                    ProgressView("Requesting verification...")
+                case .completed:
+                    Label("Verification complete", systemImage: "checkmark.circle.fill")
+                        .foregroundColor(.green)
+                case .failed:
+                    Text("Verification could not continue. You can change method or cancel sign-in.")
+                        .font(.footnote)
+                    twoFactorCancelButton()
+                case .cancelled:
+                    Text("Sign-in was cancelled.").font(.footnote)
                 }
             } else {
             ForEach(fieldDefs, id: \.self) { field in
-                if field["key"] == "mode" || field["key"] == "activeID" || field["key"] == "phoneID" || field["key"] == "url" || field["key"] == "serials" {
+                // The "technical" field is diagnostics-only output: it renders
+                // as selectable caption text below, never as an editable field.
+                if field["key"] == "step" || field["key"] == "mode" || field["key"] == "activeID" || field["key"] == "phoneID" || field["key"] == "url" || field["key"] == "serials" || field["key"] == "technical" {
                     if let value = field["value"], !value.isEmpty, field["key"] == "url" {
+                        if let repairURL = V3AuthRepairURLPolicy.openableURL(value) {
+                            Link("Open Apple Account Repair", destination: repairURL)
+                                .font(.caption)
+                        }
                         Text(value)
                             .font(.caption)
                             .foregroundColor(.secondary)
@@ -1409,6 +3666,29 @@ struct V3PromptSection: View {
             if fieldDefs.count > 0 && options.isEmpty {
                 Button("Submit") { submit(choice: "") }
                     .buttonStyle(.borderedProminent)
+                    .disabled(isSubmitting)
+            }
+            // Safe technical diagnostics travel separately from the
+            // user-facing message and can be copied without the prompt text.
+            if let technical = fieldDefs.first(where: { $0["key"] == "technical" }),
+               let value = technical["value"], !value.isEmpty {
+                Text("Technical details")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(.secondary)
+                    .padding(.top, 4)
+                Text(value)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .textSelection(.enabled)
+                Button(copiedDetails ? "Copied" : "Copy Details") {
+                    UIPasteboard.general.string = value
+                    copiedDetails = true
+                    Task {
+                        try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        copiedDetails = false
+                    }
+                }
+                .font(.caption)
             }
             if isMulti {
                 ForEach(options.filter { $0["id"] != "keep" && $0["id"] != "keepAll" }, id: \.self) { option in
@@ -1421,39 +3701,74 @@ struct V3PromptSection: View {
                             Text(option["label"] ?? "")
                         }
                     }
+                    .disabled(isSubmitting || isSubmissionBlocked)
                 }
                 if kind == "revocation" {
                     Button("Keep Existing") { submit(choice: "keep") }
+                        .disabled(isSubmitting || isSubmissionBlocked)
                 } else {
                     Button("Keep All") { submit(choice: "keepAll") }
+                        .disabled(isSubmitting || isSubmissionBlocked)
                 }
-                Button(kind == "revocation" ? "Revoke Selected" : "Remove Selected", role: .destructive) {
+                    Button(kind == "revocation" ? "Revoke Selected" : "Remove Selected", role: .destructive) {
                     var answer = fields
                     answer["choice"] = kind == "revocation" ? "revoke" : "selected"
                     answer["ids"] = selected.sorted().joined(separator: ",")
                     answer["serials"] = selected.sorted().joined(separator: ",")
-                    onAnswer(answer)
+                    respond(answer)
                 }
-                .disabled(selected.isEmpty)
+                .disabled(selected.isEmpty || isSubmitting || isSubmissionBlocked)
             } else {
                 ForEach(options, id: \.self) { option in
                     Button(option["label"] ?? "", role: (option["id"] == "cancel" || option["id"] == "deny") ? .cancel : .none) {
                         var answer = fields
                         answer["choice"] = option["id"] ?? ""
                         answer["action"] = option["id"] ?? ""
-                        onAnswer(answer)
+                        respond(answer)
                     }
+                    .disabled(isSubmitting || (isSubmissionBlocked &&
+                        !["cancel", "changeMethod"].contains(option["id"] ?? "")))
                 }
             }
             }
         }
         .onAppear {
-            for field in fieldDefs {
-                if fields[field["key"] ?? ""] == nil {
-                    fields[field["key"] ?? ""] = field["value"] ?? ""
+            loadFields()
+        }
+        .onChange(of: prompt["id"] as? String ?? "") { _ in loadFields() }
+    }
+    private func loadFields() {
+        fields = [:]
+        selected = []
+        isSubmitting = false
+        for field in fieldDefs { fields[field["key"] ?? ""] = field["value"] ?? "" }
+    }
+    private func twoFactorOption(_ option: [String: String]) -> some View {
+        Button {
+            var answer = fields
+            let id = option["id"] ?? ""
+            answer["choice"] = id
+            answer["action"] = id
+            respond(answer)
+        } label: {
+            HStack {
+                if (option["id"] ?? "").hasPrefix("phone:") {
+                    Image(systemName: "phone.fill").foregroundColor(.accentColor)
                 }
+                Text(option["label"] ?? "")
+                Spacer()
+                Image(systemName: "chevron.right").font(.caption).foregroundColor(.secondary)
             }
         }
+        .buttonStyle(.bordered)
+        .disabled(isSubmitting || (isSubmissionBlocked &&
+            !["cancel", "changeMethod"].contains(option["id"] ?? "")))
+    }
+    private func twoFactorCancelButton() -> some View {
+        Button("Cancel Sign In", role: .cancel) {
+            respond(["action": "cancel", "choice": "cancel"])
+        }
+        .disabled(isSubmitting)
     }
     private func binding(_ key: String) -> Binding<String> {
         Binding(get: { fields[key] ?? "" }, set: { fields[key] = $0 })
@@ -1464,6 +3779,11 @@ struct V3PromptSection: View {
     private func submit(choice: String) {
         var answer = fields
         answer["choice"] = choice
+        respond(answer)
+    }
+    private func respond(_ answer: [String: String]) {
+        guard !isSubmitting else { return }
+        isSubmitting = true
         onAnswer(answer)
     }
 }
@@ -1472,85 +3792,1263 @@ struct V3PromptSection: View {
 final class V3AuthStore: ObservableObject {
     @Published var state = "idle"
     @Published var prompt: [String: Any]?
+    @Published var previousFailure: [String: Any]?
     @Published var attempts = 0
+    @Published private(set) var revision = 0
     @Published var message = ""
+    @Published private(set) var currentAttemptFailure = V3AuthAttemptFailureNotice()
+    @Published private(set) var promptResponseDiagnostics = ""
+    @Published private(set) var promptResponseBlocked = false
+    @Published var deliveryProgressMessage = ""
+    @Published var twoFactorTransientStep: V3TwoFactorStep?
     @Published var team = ""
+    @Published var promptSubmitting = false
+    @Published private(set) var isCancelling = false
+    @Published private(set) var cancellationConfirmed = true
+    @Published private(set) var cancellationWasAttempted = false
+    // V3_PROVISIONING_RECOVERY_STATE_V1: a successful Apple sign-in and a failed
+    // provisioning attempt are two separate facts and are stored separately, so
+    // neither can be presented as the other. The typed provisioning guidance and
+    // the safe technical line produced by the service are preserved verbatim
+    // instead of being discarded with the terminal payload.
+    @Published private(set) var provisioningMessage = ""
+    @Published private(set) var provisioningTechnical = ""
+    @Published private(set) var provisioningCode = ""
+    @Published private(set) var provisioningStage = ""
+    @Published private(set) var provisioningCorrelation = ""
+    @Published private(set) var provisioningRetryAvailable = false
+    @Published private(set) var provisioningSessionUnavailable = false
+    @Published private(set) var provisioningRetryBlockedByActiveSession = false
+    @Published private(set) var provisioningFinishedLater = false
+    @Published private(set) var provisioningIncomplete = false
+    // Sticky once the service reports an authenticated terminal. It survives a
+    // provisioning retry so the screen keeps saying the sign-in succeeded while
+    // provisioning is running again.
+    @Published private(set) var signedIn = false
     private var session: String?
+    private var authoritativeActiveAuthenticationSessionID: String?
     private var task: Task<Void, Never>?
+    private var reconciliationGate = V3AuthReconciliationGate()
+    private var promptResponseGeneration: UInt64 = 0
 
-    func begin() {
-        task?.cancel()
-        task = Task { await run() }
+    // V3_AUTH_SUCCESS_IS_NOT_PROVISIONING_SUCCESS_V1: authentication succeeded
+    // whenever the service reports an authenticated terminal, regardless of
+    // whether provisioning then failed.
+    var isSignedIn: Bool { signedIn }
+    var hasSession: Bool { session != nil }
+    private var terminalFailureKind: String? { previousFailure?["kind"] as? String }
+    private var terminalFailureRetryable: Bool? {
+        V3ServiceBridge.strictBool(previousFailure?["retryable"])
+    }
+    var terminalFailureAction: V3AuthTerminalFailureAction {
+        V3AuthTerminalFailureActionPolicy.resolve(kind: terminalFailureKind,
+            retryable: terminalFailureRetryable)
+    }
+    var terminalFailureGuidance: String? {
+        V3AuthTerminalFailureActionPolicy.guidance(kind: terminalFailureKind,
+            retryable: terminalFailureRetryable)
+    }
+    // The provisioning problem is only present when a classified failure arrived.
+    var hasProvisioningProblem: Bool {
+        provisioningIncomplete && !provisioningMessage.isEmpty
+            && !provisioningFinishedLater
     }
 
-    private func run() async {
+    func begin() {
+        guard canBegin else { return }
+        task?.cancel()
+        let requestedSession = UUID().uuidString
+        reconciliationGate.invalidate()
+        session = requestedSession
+        attempts = 0
+        revision = 0
+        state = "working"
+        message = ""
+        currentAttemptFailure.clear()
+        promptResponseDiagnostics = ""
+        promptResponseBlocked = false
+        deliveryProgressMessage = ""
+        twoFactorTransientStep = nil
+        prompt = nil
+        previousFailure = nil
+        promptSubmitting = false
+        cancellationConfirmed = true
+        cancellationWasAttempted = false
+        signedIn = false
+        clearProvisioningOutcome()
+        task = Task { await run(sessionID: requestedSession) }
+    }
+    var canBegin: Bool {
+        !isCancelling && cancellationConfirmed && !provisioningRetryBlockedByActiveSession &&
+            !["working", "awaitingPrompt", "resultUnknown"].contains(state)
+    }
+
+    private func clearProvisioningOutcome() {
+        provisioningMessage = ""
+        provisioningTechnical = ""
+        provisioningCode = ""
+        provisioningStage = ""
+        provisioningCorrelation = ""
+        provisioningRetryAvailable = false
+        provisioningSessionUnavailable = false
+        provisioningRetryBlockedByActiveSession = false
+        provisioningFinishedLater = false
+        provisioningIncomplete = false
+    }
+
+    // V3_RETRY_PROVISIONING_REUSES_SESSION_V1: the Apple session is already
+    // authenticated, so the retry is a distinct operation. It deliberately does
+    // not reuse the interactive begin operation, which would ask for credentials
+    // and 2FA again.
+    func retryProvisioning() {
+        guard canRetryProvisioning else { return }
+        let previouslyAvailable = provisioningRetryAvailable
+        task?.cancel()
+        let requestedSession = UUID().uuidString
+        reconciliationGate.invalidate()
+        session = requestedSession
+        attempts = 0
+        revision = 0
+        state = "working"
+        message = ""
+        currentAttemptFailure.clear()
+        prompt = nil
+        previousFailure = nil
+        promptSubmitting = false
+        promptResponseDiagnostics = ""
+        promptResponseBlocked = false
+        clearProvisioningOutcome()
+        task = Task { await runProvisioningRetry(previouslyAvailable: previouslyAvailable) }
+    }
+    var canRetryProvisioning: Bool {
+        V3AuthProvisioningRecoveryPolicy.resolve(state: state, hasSession: session != nil,
+            signedIn: signedIn, provisioningRetryAvailable: provisioningRetryAvailable,
+            isCancelling: isCancelling, cancellationConfirmed: cancellationConfirmed,
+            authenticationActive: provisioningRetryBlockedByActiveSession)
+            .showRetryProvisioning
+    }
+
+    private func runProvisioningRetry(previouslyAvailable: Bool) async {
+        guard let requestedSession = session else { return }
+        let sessionDeadline = Date().addingTimeInterval(V3ServiceBridge.authSessionLifetime)
+        do {
+            let reply = try await V3ServiceBridge.shared.request(operation: "authRetryProvisioning",
+                target: requestedSession,
+                payload: ["session": requestedSession, "sessionDeadline": sessionDeadline])
+            guard V3AuthSessionResponsePolicy.mayAcceptStartedSession(
+                expectedSessionID: requestedSession, replySessionID: reply["session"] as? String,
+                currentSessionID: session, cancellationInProgress: isCancelling) else {
+                _ = try? await V3ServiceBridge.shared.request(operation: "authCancel", target: requestedSession)
+                guard !Task.isCancelled, session == requestedSession else { return }
+                await reconcile(force: true, expectedSession: requestedSession)
+                return
+            }
+            guard let id = reply["session"] as? String,
+                  reply["state"] as? String != "failed" else {
+                // The saved session is gone. Fall back to a full, honest sign-in
+                // instead of silently claiming provisioning was retried.
+                await reconcile(force: true, expectedSession: requestedSession)
+                guard !Task.isCancelled, session == requestedSession else { return }
+                if signedIn {
+                    if state == "completed" { return }
+                    state = "authenticatedProvisioningIncomplete"
+                    message = "Apple ID signed in successfully."
+                    provisioningMessage = "The saved provisioning session is no longer available. Open Account & Signing to reauthenticate before retrying setup."
+                    provisioningRetryAvailable = false
+                    provisioningSessionUnavailable = true
+                } else {
+                    state = "failed"
+                    message = reply["message"] as? String
+                        ?? "The saved Apple session is no longer valid. Sign in again with this Apple ID."
+                    provisioningMessage = ""
+                    provisioningSessionUnavailable = true
+                }
+                return
+            }
+            session = id
+            try await pollLoop(id: id, sessionDeadline: sessionDeadline)
+        } catch {
+            if isCancelling || Task.isCancelled { return }
+            let pollFailure = (error as? V3AuthPollFailure).flatMap {
+                $0.sessionID == requestedSession ? $0 : nil
+            }
+            let failureResponseGeneration = pollFailure?.promptResponseGeneration ?? promptResponseGeneration
+            if let notDispatched = error as? CombinedFailure,
+               V3AuthProvisioningRetryDispatchPolicy.isConfirmedNotDispatched(notDispatched) {
+                let reconciliationGenerationBefore = reconciliationGate.generation
+                let snapshotConfirmed = await reconcile(force: true, expectedSession: requestedSession)
+                guard V3AuthAttemptFailureCommitPolicy.mayCommit(
+                    requestedSessionID: requestedSession, currentSessionID: session,
+                    capturedPromptResponseGeneration: failureResponseGeneration,
+                    currentPromptResponseGeneration: promptResponseGeneration,
+                    reconciliationGenerationBefore: reconciliationGenerationBefore,
+                    currentReconciliationGeneration: reconciliationGate.generation,
+                    cancellationInProgress: isCancelling, taskCancelled: Task.isCancelled) else { return }
+                provisioningTechnical = notDispatched.technicalDetails
+                if signedIn {
+                    if state == "completed" {
+                        message = V3AuthProvisioningRetryDispatchPolicy.whatHappened(notDispatched) +
+                            " " + notDispatched.recovery
+                        return
+                    }
+                    state = "authenticatedProvisioningIncomplete"
+                    provisioningIncomplete = true
+                    message = "Apple ID signed in successfully."
+                    provisioningMessage = V3AuthProvisioningRetryDispatchPolicy.whatHappened(notDispatched) +
+                        " " + notDispatched.recovery
+                    if snapshotConfirmed {
+                        provisioningSessionUnavailable = !provisioningRetryAvailable &&
+                            !provisioningRetryBlockedByActiveSession
+                        if provisioningRetryBlockedByActiveSession {
+                            provisioningMessage = "Another sign-in or provisioning attempt is still active. Wait for it to finish, then reload status before retrying provisioning."
+                        }
+                        if provisioningSessionUnavailable {
+                            provisioningMessage = "Apple ID is signed in, but the saved provisioning session is unavailable. Finish Later, then reopen Account & Signing to sign in again before retrying provisioning."
+                        }
+                    } else {
+                        provisioningRetryAvailable = previouslyAvailable
+                        provisioningRetryBlockedByActiveSession =
+                            notDispatched.safeCause == .operationInProgress
+                        if provisioningRetryBlockedByActiveSession {
+                            provisioningRetryAvailable = false
+                            provisioningMessage = "Another sign-in or provisioning attempt is already active. Reload status after it finishes before retrying."
+                        }
+                        provisioningSessionUnavailable = false
+                    }
+                } else {
+                    state = "failed"
+                    message = V3AuthProvisioningRetryDispatchPolicy.whatHappened(notDispatched) +
+                        " " + notDispatched.recovery
+                    provisioningMessage = ""
+                    provisioningRetryAvailable = false
+                }
+                return
+            }
+            let reconciliationGenerationBefore = reconciliationGate.generation
+            let sessionUnavailable = ((pollFailure?.underlying ?? error) as? CombinedFailure)?.safeCause == .authSessionUnavailable
+            let snapshotConfirmed = await reconcile(force: true, expectedSession: requestedSession,
+                retireInactiveAuthSession: !sessionUnavailable)
+            if let sessionFailure = (pollFailure?.underlying ?? error) as? CombinedFailure,
+               sessionFailure.safeCause == .authSessionUnavailable {
+                resolveUnavailableAuthSession(sessionFailure, expectedSessionID: requestedSession,
+                    snapshotConfirmed: snapshotConfirmed)
+                return
+            }
+            if let pollFailure,
+               restartPollMonitorAfterSupersededFailure(sessionID: requestedSession,
+                    sessionDeadline: sessionDeadline,
+                    failedPromptRevision: pollFailure.promptRevision,
+                    failedPromptResponseGeneration: pollFailure.promptResponseGeneration,
+                    pollFailureIsTransient: (pollFailure.underlying as? CombinedFailure)
+                        .map(V3AuthPollRecoveryPolicy.isTransientTransportFailure) ?? false,
+                    provisioningRetry: true,
+                    reconciliationWasSuperseded: reconciliationGate.generation !=
+                        (reconciliationGenerationBefore &+ 1)) {
+                return
+            }
+            if pollFailure == nil,
+               V3AuthPollMonitorRecoveryPolicy.shouldResumeAfterAmbiguousStart(
+                    requestedSessionID: requestedSession, currentSessionID: session,
+                    activeSessionID: authoritativeActiveAuthenticationSessionID,
+                    cancellationInProgress: isCancelling, taskCancelled: Task.isCancelled),
+               restartPollMonitorAfterSupersededFailure(sessionID: requestedSession,
+                    sessionDeadline: sessionDeadline, failedPromptRevision: revision,
+                    failedPromptResponseGeneration: promptResponseGeneration,
+                    pollFailureIsTransient: false, provisioningRetry: true,
+                    reconciliationWasSuperseded: false) {
+                return
+            }
+            guard V3AuthAttemptFailureCommitPolicy.mayCommit(
+                requestedSessionID: requestedSession, currentSessionID: session,
+                capturedPromptResponseGeneration: failureResponseGeneration,
+                currentPromptResponseGeneration: promptResponseGeneration,
+                reconciliationGenerationBefore: reconciliationGenerationBefore,
+                currentReconciliationGeneration: reconciliationGate.generation,
+                cancellationInProgress: isCancelling, taskCancelled: Task.isCancelled) else {
+                if let pollFailure {
+                    _ = restartPollMonitorAfterSupersededFailure(sessionID: requestedSession,
+                        sessionDeadline: sessionDeadline,
+                        failedPromptRevision: pollFailure.promptRevision,
+                        failedPromptResponseGeneration: pollFailure.promptResponseGeneration,
+                        pollFailureIsTransient: (pollFailure.underlying as? CombinedFailure)
+                            .map(V3AuthPollRecoveryPolicy.isTransientTransportFailure) ?? false,
+                        provisioningRetry: true,
+                        reconciliationWasSuperseded: reconciliationGate.generation !=
+                            (reconciliationGenerationBefore &+ 1))
+                }
+                return
+            }
+            if let pollFailure, prompt != nil {
+                let underlying = pollFailure.underlying
+                state = "resultUnknown"
+                prompt = nil
+                promptSubmitting = false
+                deliveryProgressMessage = ""
+                twoFactorTransientStep = nil
+                cancellationConfirmed = false
+                message = "Apple ID is signed in, but SideStore could not confirm the current verification or provisioning response. Cancel the unconfirmed session before starting another attempt."
+                provisioningMessage = V3FailureGuidance.message(underlying)
+                provisioningTechnical = (underlying as? CombinedFailure)?.technicalDetails ?? ""
+                provisioningIncomplete = true
+                provisioningRetryAvailable = false
+                provisioningSessionUnavailable = false
+                currentAttemptFailure.record(snapshotConfirmed: snapshotConfirmed,
+                    authenticated: signedIn, failureMessage: V3FailureGuidance.message(underlying),
+                    technicalDetails: provisioningTechnical)
+                return
+            }
+            provisioningTechnical = ((pollFailure?.underlying ?? error) as? CombinedFailure)?.technicalDetails ?? ""
+            if signedIn {
+                if state == "completed" { return }
+                if snapshotConfirmed && provisioningSessionUnavailable {
+                    provisioningMessage = "Apple ID is signed in, but the saved provisioning session is unavailable. Open Account & Signing to sign in again before retrying setup."
+                    provisioningRetryAvailable = false
+                    return
+                }
+                state = "authenticatedProvisioningIncomplete"
+                provisioningMessage = pollFailure.map {
+                    "Apple ID is signed in, but SideStore could not confirm the provisioning result. " +
+                        V3FailureGuidance.message($0.underlying)
+                } ?? "Retry Provisioning could not be confirmed. Your last confirmed state is still signed in. Reload status, then try again."
+                provisioningRetryAvailable = V3ProvisioningRetryRecoveryPolicy.availabilityAfterFailure(
+                    snapshotConfirmed: snapshotConfirmed,
+                    snapshotAllowsRetry: provisioningRetryAvailable,
+                    previouslyConfirmedAvailable: previouslyAvailable)
+                provisioningSessionUnavailable = snapshotConfirmed ? provisioningSessionUnavailable : false
+            } else {
+                state = "failed"
+                message = "The provisioning retry could not be started, and SideStore could not confirm the account state. Check Account & Signing, then reload status."
+                provisioningMessage = ""
+                provisioningRetryAvailable = false
+            }
+        }
+    }
+
+    // V3_FINISH_LATER_PRESERVES_ACCOUNT_V1: closing the provisioning flow must
+    // not sign the account out. It only dismisses the local recovery
+    // presentation; authoritative account state is reloaded afterwards.
+    func finishProvisioningLater() {
+        provisioningMessage = ""
+        provisioningTechnical = ""
+        provisioningFinishedLater = true
+    }
+
+    @discardableResult
+    func reconcile(force: Bool = false, expectedSession: String? = nil,
+                   retireInactiveAuthSession: Bool = true) async -> Bool {
+        guard force || !["working", "awaitingPrompt"].contains(state) else { return false }
+        guard V3AuthReconciliationSessionPolicy.mayStart(
+            expectedSessionID: expectedSession, currentSessionID: session) else { return false }
+        let ticket = reconciliationGate.begin(sessionID: session, state: state, revision: revision)
+        authoritativeActiveAuthenticationSessionID = nil
+        let reportedTerminalState = state
+        do {
+            let snapshot = try await V3ServiceBridge.shared.request(operation: "snapshot")
+            guard reconciliationGate.mayApply(ticket, sessionID: session,
+                state: state, revision: revision) else { return false }
+            guard let authSnapshot = V3ServiceBridge.authSnapshot(snapshot) else {
+                message = "SideStore returned account status that could not be validated. Reload status and try again."
+                return false
+            }
+            let accountFacts = V3AuthSnapshotAuthorityPolicy.facts(authSnapshot)
+            authoritativeActiveAuthenticationSessionID = accountFacts.authenticationSessionID
+            let ownerSessionID = expectedSession ?? session
+            let authenticationActiveForCurrentSession = V3AuthSessionCorrelationPolicy.isActive(
+                sessionID: ownerSessionID, authenticationActive: accountFacts.authenticationActive,
+                activeSessionID: accountFacts.authenticationSessionID)
+            let anotherSessionActive = V3AuthSessionCorrelationPolicy.hasOtherActiveSession(
+                sessionID: ownerSessionID, authenticationActive: accountFacts.authenticationActive,
+                activeSessionID: accountFacts.authenticationSessionID)
+            if V3AuthReconciliationPresentationPolicy.shouldPreserveActivePrompt(
+                reportedState: reportedTerminalState, hasPrompt: prompt != nil,
+                activeSessionMatches: session != nil && (expectedSession == nil || expectedSession == session),
+                cancellationInProgress: isCancelling) && authenticationActiveForCurrentSession {
+                // The exact SideSign prompt/session is the current authority
+                // while credentials, 2FA, or team selection are in flight. A
+                // separate account snapshot can observe authenticated=true
+                // before provisioning activates its account row; it must not
+                // replace an answerable prompt with a terminal UI state.
+                signedIn = accountFacts.authenticated
+                provisioningIncomplete = accountFacts.provisioningIncomplete
+                if let snapshotTeam = snapshot["team"] as? String { team = snapshotTeam }
+                return true
+            }
+            // A persisted account row can outlive an authenticated Apple
+            // session. Only SideStore's explicit session fact proves that
+            // authentication is currently active.
+            let authoritative = accountFacts.authenticated
+            let incomplete = accountFacts.provisioningIncomplete
+            let canRetryProvisioning = accountFacts.provisioningRetryAvailable
+            let authenticationActive = accountFacts.authenticationActive
+            if retireInactiveAuthSession, !authenticationActiveForCurrentSession,
+               let ownerSessionID {
+                V3ServiceBridge.shared.reconcileAuthSessionOwnership(
+                    sessionID: ownerSessionID, authenticationActive: false)
+                if session == ownerSessionID { session = nil }
+                cancellationConfirmed = true
+                cancellationWasAttempted = false
+            }
+            let reconciliationState = V3AuthUnknownResultReconciliationPolicy.reportedState(
+                originalState: reportedTerminalState, hasSession: session != nil,
+                authenticated: accountFacts.authenticated)
+            let resolvesUnknownAttempt = reportedTerminalState == "resultUnknown" && session == nil &&
+                !accountFacts.authenticated
+            if authoritative {
+                // V3_FINISH_LATER_RECONCILES_AS_SIGNED_IN_V1: authoritative state
+                // wins. A finished-later provisioning attempt still reconciles as
+                // signed in, never back to "sign in again".
+                signedIn = true
+                if reportedTerminalState == "resultUnknown", session == nil {
+                    // The original attempt remains unconfirmed, but no host-owned
+                    // SideSign session remains. A separately admitted provisioning
+                    // retry is safe when the authoritative snapshot permits it.
+                    cancellationConfirmed = true
+                    cancellationWasAttempted = false
+                }
+                let previousFailureMessage = reportedTerminalState == "failed"
+                    ? previousFailure.map { Self.failureMessage(from: $0) } : nil
+                let presentation = V3AuthReconciliationPresentationPolicy.resolve(
+                    reportedState: reconciliationState, authenticated: true,
+                    provisioningIncomplete: incomplete,
+                    previousFailureMessage: previousFailureMessage,
+                    authenticationActive: authenticationActiveForCurrentSession)
+                state = presentation.state
+                message = presentation.message
+                team = snapshot["team"] as? String ?? ""
+                if incomplete || authenticationActiveForCurrentSession {
+                    provisioningIncomplete = true
+                    // The service still reports an authenticated session whose
+                    // provisioning never activated an account. Preserve any
+                    // terminal attempt state while showing provisioning recovery
+                    // as a separate account-state fact.
+                    if provisioningMessage.isEmpty {
+                        provisioningMessage = "Device provisioning did not complete. Retry provisioning, or finish later and come back."
+                    }
+                    // The account snapshot alone does not prove the process-local
+                    // authenticated session needed to resume provisioning survived.
+                    provisioningRetryAvailable = authenticationActive ? false : canRetryProvisioning
+                    provisioningRetryBlockedByActiveSession = authenticationActive
+                    provisioningSessionUnavailable = !canRetryProvisioning && !authenticationActive
+                    if canRetryProvisioning && reportedTerminalState == "resultUnknown" {
+                        provisioningMessage = "Apple ID is signed in, but provisioning is incomplete. The previous sign-in attempt remains unconfirmed; you can retry provisioning in a new session."
+                    } else if authenticationActiveForCurrentSession {
+                        provisioningMessage = "Another sign-in or provisioning attempt is still active. Wait for it to finish, then reload status before retrying provisioning."
+                    } else if !canRetryProvisioning {
+                        provisioningMessage = "Apple ID is signed in, but the saved provisioning session is unavailable. Finish Later, then reopen Account & Signing to sign in again before retrying provisioning."
+                    }
+                } else {
+                    clearProvisioningOutcome()
+                }
+            } else {
+                signedIn = false
+                team = ""
+                provisioningRetryBlockedByActiveSession = authenticationActive
+                let inactiveSessionPresentation = V3AuthInactiveSessionResolutionPolicy.resolve(
+                    reportedState: reportedTerminalState, authenticated: false,
+                    authenticationActive: authenticationActiveForCurrentSession,
+                    anotherSessionActive: anotherSessionActive)
+                let signedOutPresentation = inactiveSessionPresentation ??
+                    V3AuthReconciliationPresentationPolicy.resolve(
+                        reportedState: reconciliationState, authenticated: false,
+                        provisioningIncomplete: false)
+                if let inactiveSessionPresentation {
+                    state = inactiveSessionPresentation.state
+                    message = inactiveSessionPresentation.message
+                    prompt = nil
+                    promptSubmitting = false
+                    deliveryProgressMessage = ""
+                    twoFactorTransientStep = nil
+                } else if resolvesUnknownAttempt {
+                    state = "failed"
+                    cancellationConfirmed = true
+                    cancellationWasAttempted = false
+                    currentAttemptFailure.clear()
+                    message = "SideStore confirmed that no account is signed in. You can start a new sign-in."
+                } else if state == "idle" || state == "completed" || state == "authenticatedProvisioningIncomplete" {
+                    state = "idle"
+                    prompt = nil
+                    clearProvisioningOutcome()
+                }
+                if !resolvesUnknownAttempt && !signedOutPresentation.message.isEmpty {
+                    message = signedOutPresentation.message
+                }
+            }
+            if anotherSessionActive {
+                provisioningRetryBlockedByActiveSession = true
+                if let presentation = V3AuthOtherSessionReconciliationPolicy.resolve(
+                    reportedState: reportedTerminalState, authenticated: authoritative,
+                    anotherSessionActive: true) {
+                    state = presentation.state
+                    message = presentation.message
+                    if presentation.clearPrompt {
+                        prompt = nil
+                        promptSubmitting = false
+                        deliveryProgressMessage = ""
+                        twoFactorTransientStep = nil
+                        cancellationConfirmed = true
+                    }
+                } else if state == "completed" {
+                    message = "Apple ID is signed in. Another sign-in or provisioning session is active; wait for it to finish before starting another account action."
+                }
+            }
+            return true
+        } catch {
+            guard reconciliationGate.mayApply(ticket, sessionID: session,
+                state: state, revision: revision) else { return false }
+            if state == "idle" { message = "Could not confirm the current SideStore account. Reload status and try again." }
+            return false
+        }
+    }
+
+    private func resolveUnavailableAuthSession(_ failure: CombinedFailure,
+                                               expectedSessionID: String,
+                                               snapshotConfirmed: Bool) {
+        guard V3AuthSessionUnavailablePolicy.shouldRetireOwnership(
+            sessionID: expectedSessionID, currentSessionID: session, failure: failure) else { return }
+        V3ServiceBridge.shared.confirmAuthSessionUnavailable(sessionID: expectedSessionID)
+        let anotherSessionActive = snapshotConfirmed && authoritativeActiveAuthenticationSessionID != nil &&
+            authoritativeActiveAuthenticationSessionID != expectedSessionID
+        let presentation = V3AuthSessionUnavailablePolicy.resolve(
+            authenticated: signedIn, provisioningIncomplete: provisioningIncomplete,
+            snapshotConfirmed: snapshotConfirmed, safeMessage: failure.safeMessage,
+            recovery: failure.recovery, anotherSessionActive: anotherSessionActive)
+        session = nil
+        cancellationConfirmed = presentation.cancellationConfirmed
+        cancellationWasAttempted = false
+        prompt = nil
+        promptSubmitting = false
+        deliveryProgressMessage = ""
+        twoFactorTransientStep = nil
+        state = presentation.state
+        message = presentation.message
+        if anotherSessionActive { provisioningRetryBlockedByActiveSession = true }
+        if let provisioningMessage = presentation.provisioningMessage {
+            provisioningIncomplete = true
+            self.provisioningMessage = provisioningMessage
+            provisioningTechnical = failure.technicalDetails
+            provisioningStage = failure.stage.rawValue
+            provisioningCode = failure.code.rawValue
+            provisioningCorrelation = failure.correlationID
+            provisioningRetryAvailable = false
+            provisioningSessionUnavailable = true
+            provisioningFinishedLater = false
+        } else {
+            clearProvisioningOutcome()
+            if presentation.state == "resultUnknown" {
+                currentAttemptFailure.record(snapshotConfirmed: false,
+                    authenticated: false, failureMessage: failure.safeMessage,
+                    technicalDetails: failure.technicalDetails)
+            } else if signedIn {
+                currentAttemptFailure.clear()
+            } else {
+                currentAttemptFailure.record(snapshotConfirmed: snapshotConfirmed,
+                    authenticated: false, failureMessage: failure.safeMessage,
+                    technicalDetails: failure.technicalDetails)
+            }
+        }
+        task = nil
+        NSLog("[V3_AUTH_UI] SESSION_UNAVAILABLE state=%@ signed_in=%d snapshot_confirmed=%d",
+              presentation.state, signedIn ? 1 : 0, snapshotConfirmed ? 1 : 0)
+    }
+
+    private func run(sessionID requestedSession: String) async {
+        let sessionDeadline = Date().addingTimeInterval(V3ServiceBridge.authSessionLifetime)
         do {
             state = "working"
             message = ""
             prompt = nil
-            let reply = try await V3ServiceBridge.shared.request(operation: "authBegin")
+            let reply = try await V3ServiceBridge.shared.request(operation: "authBegin",
+                target: requestedSession,
+                payload: ["session": requestedSession, "sessionDeadline": sessionDeadline])
+            guard V3AuthSessionResponsePolicy.mayAcceptStartedSession(
+                expectedSessionID: requestedSession, replySessionID: reply["session"] as? String,
+                currentSessionID: session, cancellationInProgress: isCancelling) else {
+                _ = try? await V3ServiceBridge.shared.request(operation: "authCancel", target: requestedSession)
+                guard !Task.isCancelled, session == requestedSession else { return }
+                await reconcile(force: true, expectedSession: requestedSession)
+                return
+            }
             guard let id = reply["session"] as? String else {
                 throw NSError(domain: "V3Auth", code: 1,
                               userInfo: [NSLocalizedDescriptionKey: "The service did not start sign-in."])
             }
             session = id
-            try await pollLoop(id: id)
+            try await pollLoop(id: id, sessionDeadline: sessionDeadline)
         } catch {
-            state = "failed"
-            message = error.localizedDescription
+            if isCancelling || Task.isCancelled { return }
+            let pollFailure = (error as? V3AuthPollFailure).flatMap {
+                $0.sessionID == requestedSession ? $0 : nil
+            }
+            let failureResponseGeneration = pollFailure?.promptResponseGeneration ?? promptResponseGeneration
+            if let notDispatched = error as? CombinedFailure,
+               V3AuthAttemptStartFailurePolicy.isConfirmedNotDispatched(notDispatched) {
+                let reconciliationGenerationBefore = reconciliationGate.generation
+                let snapshotConfirmed = await reconcile(force: true, expectedSession: requestedSession)
+                if V3AuthAttemptFailureCommitPolicy.shouldPreserveAuthoritativeAccountState(
+                    snapshotConfirmed: snapshotConfirmed, authenticated: signedIn, state: state) {
+                    session = nil
+                    cancellationConfirmed = true
+                    cancellationWasAttempted = false
+                    currentAttemptFailure.clear()
+                    return
+                }
+                guard V3AuthAttemptFailureCommitPolicy.mayCommit(
+                    requestedSessionID: requestedSession, currentSessionID: session,
+                    capturedPromptResponseGeneration: failureResponseGeneration,
+                    currentPromptResponseGeneration: promptResponseGeneration,
+                    reconciliationGenerationBefore: reconciliationGenerationBefore,
+                    currentReconciliationGeneration: reconciliationGate.generation,
+                    cancellationInProgress: isCancelling, taskCancelled: Task.isCancelled) else { return }
+                state = "failed"
+                cancellationConfirmed = true
+                session = nil
+                message = notDispatched.safeMessage + " " + notDispatched.recovery
+                currentAttemptFailure.clear()
+                return
+            }
+            let underlyingError = pollFailure?.underlying ?? error
+            let failureMessage = V3FailureGuidance.message(underlyingError)
+            let failureTechnical = (underlyingError as? CombinedFailure)?.technicalDetails ?? ""
+            // A thrown start/poll request does not prove the authentication
+            // attempt reached a terminal result. Reconcile account state for
+            // display, but keep the attempt outcome unknown until its session
+            // is cancelled or a correlated terminal reply arrives.
+            let reconciliationGenerationBefore = reconciliationGate.generation
+            let sessionUnavailable = ((pollFailure?.underlying ?? error) as? CombinedFailure)?.safeCause == .authSessionUnavailable
+            let snapshotConfirmed = await reconcile(force: true, expectedSession: requestedSession,
+                retireInactiveAuthSession: !sessionUnavailable)
+            if let sessionFailure = (pollFailure?.underlying ?? error) as? CombinedFailure,
+               sessionFailure.safeCause == .authSessionUnavailable {
+                resolveUnavailableAuthSession(sessionFailure, expectedSessionID: requestedSession,
+                    snapshotConfirmed: snapshotConfirmed)
+                return
+            }
+            if let pollFailure,
+               restartPollMonitorAfterSupersededFailure(sessionID: requestedSession,
+                    sessionDeadline: sessionDeadline,
+                    failedPromptRevision: pollFailure.promptRevision,
+                    failedPromptResponseGeneration: pollFailure.promptResponseGeneration,
+                    pollFailureIsTransient: (pollFailure.underlying as? CombinedFailure)
+                        .map(V3AuthPollRecoveryPolicy.isTransientTransportFailure) ?? false,
+                    provisioningRetry: false,
+                    reconciliationWasSuperseded: reconciliationGate.generation !=
+                        (reconciliationGenerationBefore &+ 1)) {
+                return
+            }
+            if pollFailure == nil,
+               V3AuthPollMonitorRecoveryPolicy.shouldResumeAfterAmbiguousStart(
+                    requestedSessionID: requestedSession, currentSessionID: session,
+                    activeSessionID: authoritativeActiveAuthenticationSessionID,
+                    cancellationInProgress: isCancelling, taskCancelled: Task.isCancelled),
+               restartPollMonitorAfterSupersededFailure(sessionID: requestedSession,
+                    sessionDeadline: sessionDeadline, failedPromptRevision: revision,
+                    failedPromptResponseGeneration: promptResponseGeneration,
+                    pollFailureIsTransient: false, provisioningRetry: false,
+                    reconciliationWasSuperseded: false) {
+                return
+            }
+            if V3AuthAttemptFailureCommitPolicy.shouldPreserveAuthoritativeAccountState(
+                snapshotConfirmed: snapshotConfirmed, authenticated: signedIn, state: state) {
+                return
+            }
+            if V3AuthAttemptFailureCommitPolicy.shouldCommitConfirmedSignedOutFailure(
+                snapshotConfirmed: snapshotConfirmed, authenticated: signedIn,
+                hasSession: session != nil, cancellationConfirmed: cancellationConfirmed,
+                state: state) {
+                currentAttemptFailure.record(snapshotConfirmed: true, authenticated: false,
+                    failureMessage: failureMessage, technicalDetails: failureTechnical)
+                return
+            }
+            guard V3AuthAttemptFailureCommitPolicy.mayCommit(
+                requestedSessionID: requestedSession, currentSessionID: session,
+                capturedPromptResponseGeneration: failureResponseGeneration,
+                currentPromptResponseGeneration: promptResponseGeneration,
+                reconciliationGenerationBefore: reconciliationGenerationBefore,
+                currentReconciliationGeneration: reconciliationGate.generation,
+                cancellationInProgress: isCancelling, taskCancelled: Task.isCancelled) else {
+                if let pollFailure {
+                    _ = restartPollMonitorAfterSupersededFailure(sessionID: requestedSession,
+                        sessionDeadline: sessionDeadline,
+                        failedPromptRevision: pollFailure.promptRevision,
+                        failedPromptResponseGeneration: pollFailure.promptResponseGeneration,
+                        pollFailureIsTransient: (pollFailure.underlying as? CombinedFailure)
+                            .map(V3AuthPollRecoveryPolicy.isTransientTransportFailure) ?? false,
+                        provisioningRetry: false,
+                        reconciliationWasSuperseded: reconciliationGate.generation !=
+                            (reconciliationGenerationBefore &+ 1))
+                }
+                return
+            }
+            state = "resultUnknown"
+            prompt = nil
+            promptSubmitting = false
+            deliveryProgressMessage = ""
+            twoFactorTransientStep = nil
+            cancellationConfirmed = false
+            message = snapshotConfirmed
+                ? "SideStore confirmed account status but could not confirm whether this sign-in attempt finished. Cancel the unconfirmed session before starting another attempt."
+                : "SideStore could not confirm the sign-in result. Cancel the unconfirmed session before starting another attempt."
+            currentAttemptFailure.record(snapshotConfirmed: snapshotConfirmed,
+                authenticated: signedIn, failureMessage: failureMessage,
+                technicalDetails: failureTechnical)
         }
     }
 
-    private func pollLoop(id: String) async throws {
+    private func pollLoop(id: String, sessionDeadline: Date) async throws {
+        var pollFailureCount = 0
         while !Task.isCancelled {
             try await Task.sleep(nanoseconds: 1_000_000_000)
             try Task.checkCancellation()
-            let reply = try await V3ServiceBridge.shared.request(operation: "authPoll", target: id)
+            guard !isCancelling, session == id else { throw CancellationError() }
+            if ["completed", "failed", "timedOut", "promptExpired", "cancelled"].contains(state) ||
+               (state == "authenticatedProvisioningIncomplete" && !provisioningRetryBlockedByActiveSession) {
+                return
+            }
+            guard Date() < sessionDeadline else {
+                state = "timedOut"
+                message = "Sign-in timed out. Checking the current SideStore account..."
+                prompt = nil
+                await reconcile(force: true, expectedSession: id)
+                return
+            }
+            let pollRevision = revision
+            let pollPromptResponseGeneration = promptResponseGeneration
+            let reply: [String: Any]
+            do {
+                reply = try await V3ServiceBridge.shared.request(operation: "authPoll", target: id,
+                    requestDeadline: sessionDeadline)
+                if message == "Connection to SideStore was interrupted. Waiting for the current sign-in result..." {
+                    message = ""
+                }
+                pollFailureCount = 0
+            } catch let failure as CombinedFailure
+                where V3AuthPollRecoveryPolicy.shouldRetry(failure, sessionDeadline: sessionDeadline) {
+                if V3AuthPollFailureRacePolicy.shouldIgnore(
+                    requestedSessionID: id, currentSessionID: session,
+                    requestedRevision: pollRevision, currentRevision: revision,
+                    requestedPromptResponseGeneration: pollPromptResponseGeneration,
+                    currentPromptResponseGeneration: promptResponseGeneration,
+                    promptSubmissionInProgress: promptSubmitting) {
+                    continue
+                }
+                pollFailureCount += 1
+                message = "Connection to SideStore was interrupted. Waiting for the current sign-in result..."
+                let delay = V3AuthPollRecoveryPolicy.retryDelay(attempt: pollFailureCount - 1,
+                    remaining: sessionDeadline.timeIntervalSinceNow)
+                guard delay > 0 else {
+                    state = "timedOut"
+                    message = "Sign-in timed out. Checking the current SideStore account..."
+                    prompt = nil
+                    await reconcile(force: true, expectedSession: id)
+                    return
+                }
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                continue
+            } catch let failure as CombinedFailure
+                where V3AuthPollRecoveryPolicy.shouldFinishTimedOut(
+                    failure, sessionDeadline: sessionDeadline) {
+                if V3AuthPollFailureRacePolicy.shouldIgnore(
+                    requestedSessionID: id, currentSessionID: session,
+                    requestedRevision: pollRevision, currentRevision: revision,
+                    requestedPromptResponseGeneration: pollPromptResponseGeneration,
+                    currentPromptResponseGeneration: promptResponseGeneration,
+                    promptSubmissionInProgress: promptSubmitting) {
+                    continue
+                }
+                state = "timedOut"
+                message = "Sign-in timed out. Checking the current SideStore account..."
+                prompt = nil
+                await reconcile(force: true, expectedSession: id)
+                return
+            } catch {
+                if V3AuthPollFailureRacePolicy.shouldIgnore(
+                    requestedSessionID: id, currentSessionID: session,
+                    requestedRevision: pollRevision, currentRevision: revision,
+                    requestedPromptResponseGeneration: pollPromptResponseGeneration,
+                    currentPromptResponseGeneration: promptResponseGeneration,
+                    promptSubmissionInProgress: promptSubmitting) {
+                    continue
+                }
+                if error is CancellationError { throw error }
+                throw V3AuthPollFailure(underlying: error, sessionID: id,
+                    promptResponseGeneration: pollPromptResponseGeneration,
+                    promptRevision: pollRevision)
+            }
+            guard V3AuthPollResponsePolicy.mayApply(
+                currentSessionID: session, replySessionID: reply["session"] as? String ?? "",
+                cancellationInProgress: isCancelling,
+                currentRevision: revision,
+                replyRevision: V3ServiceBridge.strictInt(reply["revision"]),
+                currentPromptID: prompt?["id"] as? String,
+                replyPromptID: (reply["prompt"] as? [String: Any])?["id"] as? String) else {
+                continue
+            }
+            guard !Task.isCancelled, !isCancelling, session == id else { throw CancellationError() }
             apply(reply)
-            guard let current = reply["state"] as? String, current == "working" || current == "awaitingPrompt" else { return }
+            guard let current = reply["state"] as? String else { return }
+            if V3AuthTimeoutReconciliationPolicy.shouldReconcileAfterTerminal(current) {
+                await reconcile(force: true, expectedSession: id)
+                return
+            }
+            if Date() >= sessionDeadline && (current == "working" || current == "awaitingPrompt") {
+                state = "timedOut"
+                message = "Sign-in timed out. Checking the current SideStore account..."
+                prompt = nil
+                await reconcile(force: true, expectedSession: id)
+                return
+            }
+            guard current == "working" || current == "awaitingPrompt" else { return }
+        }
+    }
+
+    func reloadAuthoritativeAccountStatus() {
+        guard !isCancelling else { return }
+        Task { @MainActor in
+            let confirmed = await reconcile(force: true)
+            if !confirmed && state == "resultUnknown" {
+                cancellationConfirmed = false
+                message = "SideStore could not confirm the account state. Reload status again before starting a new sign-in."
+            }
+        }
+    }
+
+    // A poll can fail while an answer is being submitted. The old monitor then
+    // unwinds, and its catch awaits an account snapshot. If that answer wins
+    // during reconciliation, the failure is stale and must hand ownership to a
+    // replacement monitor for the same bounded session.
+    private func restartPollMonitorAfterSupersededFailure(sessionID: String,
+        sessionDeadline: Date, failedPromptRevision: Int,
+        failedPromptResponseGeneration: UInt64,
+        pollFailureIsTransient: Bool,
+        provisioningRetry: Bool,
+        reconciliationWasSuperseded: Bool) -> Bool {
+        guard V3AuthPollMonitorRecoveryPolicy.shouldResume(
+            requestedSessionID: sessionID, currentSessionID: session,
+            failedPromptRevision: failedPromptRevision, currentPromptRevision: revision,
+            failedPromptResponseGeneration: failedPromptResponseGeneration,
+            currentPromptResponseGeneration: promptResponseGeneration, state: state,
+            promptSubmissionInProgress: promptSubmitting,
+            activeSessionID: authoritativeActiveAuthenticationSessionID,
+            pollFailureIsTransient: pollFailureIsTransient, cancellationInProgress: isCancelling,
+            taskCancelled: Task.isCancelled,
+            reconciliationWasSuperseded: reconciliationWasSuperseded,
+            sessionDeadline: sessionDeadline) else { return false }
+        task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.continuePollingAfterSupersededFailure(sessionID: sessionID,
+                sessionDeadline: sessionDeadline, provisioningRetry: provisioningRetry)
+        }
+        return true
+    }
+
+    private func continuePollingAfterSupersededFailure(sessionID: String,
+        sessionDeadline: Date, provisioningRetry: Bool) async {
+        var monitorFailureCount = 0
+        while !Task.isCancelled, !isCancelling, session == sessionID {
+            do {
+                try await pollLoop(id: sessionID, sessionDeadline: sessionDeadline)
+                return
+            } catch let failure as V3AuthPollFailure where failure.sessionID == sessionID {
+                let reconciliationGenerationBefore = reconciliationGate.generation
+                let sessionUnavailable = (failure.underlying as? CombinedFailure)?.safeCause == .authSessionUnavailable
+                let snapshotConfirmed = await reconcile(force: true, expectedSession: sessionID,
+                    retireInactiveAuthSession: !sessionUnavailable)
+                if let combined = failure.underlying as? CombinedFailure,
+                   combined.safeCause == .authSessionUnavailable {
+                    resolveUnavailableAuthSession(combined, expectedSessionID: sessionID,
+                        snapshotConfirmed: snapshotConfirmed)
+                    return
+                }
+                if V3AuthPollMonitorRecoveryPolicy.shouldResume(
+                    requestedSessionID: sessionID, currentSessionID: session,
+                    failedPromptRevision: failure.promptRevision, currentPromptRevision: revision,
+                    failedPromptResponseGeneration: failure.promptResponseGeneration,
+                    currentPromptResponseGeneration: promptResponseGeneration, state: state,
+                    promptSubmissionInProgress: promptSubmitting,
+                    activeSessionID: authoritativeActiveAuthenticationSessionID,
+                    pollFailureIsTransient: (failure.underlying as? CombinedFailure)
+                        .map(V3AuthPollRecoveryPolicy.isTransientTransportFailure) ?? false,
+                    cancellationInProgress: isCancelling,
+                    taskCancelled: Task.isCancelled,
+                    reconciliationWasSuperseded: reconciliationGate.generation !=
+                        (reconciliationGenerationBefore &+ 1),
+                    sessionDeadline: sessionDeadline) {
+                    if let combined = failure.underlying as? CombinedFailure,
+                       V3AuthPollRecoveryPolicy.isTransientTransportFailure(combined),
+                       prompt != nil &&
+                       failure.promptResponseGeneration == promptResponseGeneration &&
+                       failure.promptRevision == revision && !promptSubmitting {
+                        message = "Connection to SideStore was interrupted while checking this verification request. The current response is still available."
+                    }
+                    monitorFailureCount += 1
+                    let delay = V3AuthPollRecoveryPolicy.retryDelay(attempt: monitorFailureCount - 1,
+                        remaining: sessionDeadline.timeIntervalSinceNow)
+                    if delay > 0 {
+                        try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    }
+                    if Task.isCancelled { return }
+                    continue
+                }
+                if V3AuthAttemptFailureCommitPolicy.shouldPreserveAuthoritativeAccountState(
+                    snapshotConfirmed: snapshotConfirmed, authenticated: signedIn, state: state) {
+                    return
+                }
+                let failedMessage = V3FailureGuidance.message(failure.underlying)
+                let failedTechnical = (failure.underlying as? CombinedFailure)?.technicalDetails ?? ""
+                if V3AuthAttemptFailureCommitPolicy.shouldCommitConfirmedSignedOutFailure(
+                    snapshotConfirmed: snapshotConfirmed, authenticated: signedIn,
+                    hasSession: session != nil, cancellationConfirmed: cancellationConfirmed,
+                    state: state) {
+                    currentAttemptFailure.record(snapshotConfirmed: true, authenticated: false,
+                        failureMessage: failedMessage, technicalDetails: failedTechnical)
+                    return
+                }
+                guard V3AuthAttemptFailureCommitPolicy.mayCommit(
+                    requestedSessionID: sessionID, currentSessionID: session,
+                    capturedPromptResponseGeneration: failure.promptResponseGeneration,
+                    currentPromptResponseGeneration: promptResponseGeneration,
+                    reconciliationGenerationBefore: reconciliationGenerationBefore,
+                    currentReconciliationGeneration: reconciliationGate.generation,
+                    cancellationInProgress: isCancelling, taskCancelled: Task.isCancelled) else { return }
+                let underlying = failure.underlying
+                if provisioningRetry, signedIn, state != "completed", prompt != nil {
+                    state = "resultUnknown"
+                    prompt = nil
+                    promptSubmitting = false
+                    deliveryProgressMessage = ""
+                    twoFactorTransientStep = nil
+                    cancellationConfirmed = false
+                    message = "Apple ID is signed in, but SideStore could not confirm the current verification or provisioning response. Cancel the unconfirmed session before starting another attempt."
+                    provisioningMessage = V3FailureGuidance.message(underlying)
+                    provisioningTechnical = (underlying as? CombinedFailure)?.technicalDetails ?? ""
+                    provisioningIncomplete = true
+                    provisioningRetryAvailable = false
+                    provisioningSessionUnavailable = false
+                    currentAttemptFailure.record(snapshotConfirmed: snapshotConfirmed,
+                        authenticated: signedIn, failureMessage: V3FailureGuidance.message(underlying),
+                        technicalDetails: provisioningTechnical)
+                    return
+                }
+                if provisioningRetry, signedIn, state != "completed" {
+                    state = "authenticatedProvisioningIncomplete"
+                    provisioningIncomplete = true
+                    message = "Apple ID signed in successfully."
+                    provisioningMessage = "SideStore could not confirm the provisioning result. " +
+                        V3FailureGuidance.message(underlying)
+                    provisioningTechnical = (underlying as? CombinedFailure)?.technicalDetails ?? ""
+                    provisioningSessionUnavailable = false
+                    return
+                }
+                state = "resultUnknown"
+                prompt = nil
+                promptSubmitting = false
+                deliveryProgressMessage = ""
+                twoFactorTransientStep = nil
+                cancellationConfirmed = false
+                message = snapshotConfirmed
+                    ? "SideStore confirmed account status but could not confirm whether this sign-in attempt finished. Cancel the unconfirmed session before starting another attempt."
+                    : "SideStore could not confirm the sign-in result. Cancel the unconfirmed session before starting another attempt."
+                currentAttemptFailure.record(snapshotConfirmed: snapshotConfirmed,
+                    authenticated: signedIn, failureMessage: V3FailureGuidance.message(underlying),
+                    technicalDetails: (underlying as? CombinedFailure)?.technicalDetails ?? "")
+                return
+            } catch {
+                return
+            }
         }
     }
 
     private func apply(_ reply: [String: Any]) {
+        let oldPromptID = prompt?["id"] as? String
         state = reply["state"] as? String ?? state
-        attempts = reply["attempts"] as? Int ?? attempts
+        if ["completed", "authenticatedProvisioningIncomplete", "failed", "timedOut", "promptExpired", "cancelled"].contains(state) {
+            currentAttemptFailure.clear()
+            provisioningRetryBlockedByActiveSession = false
+        }
+        attempts = V3ServiceBridge.strictInt(reply["attempts"]) ?? attempts
+        revision = V3ServiceBridge.strictInt(reply["revision"]) ?? revision
         prompt = reply["prompt"] as? [String: Any]
+        previousFailure = V3AuthPromptFailurePolicy.applying(reply: reply, current: previousFailure)
+        if V3ServiceBridge.strictBool(reply["authenticated"]) == true { signedIn = true }
+        if oldPromptID != (prompt?["id"] as? String) {
+            promptSubmitting = false
+            promptResponseDiagnostics = ""
+            promptResponseBlocked = false
+            if state == "awaitingPrompt" {
+                if V3AuthPromptResponsePolicy.shouldClearSubmissionFailure(
+                    oldPromptID: oldPromptID, newPromptID: prompt?["id"] as? String,
+                    state: state) { message = "" }
+                deliveryProgressMessage = ""
+                twoFactorTransientStep = nil
+            }
+        }
         if state == "completed" {
             team = reply["team"] as? String ?? ""
             prompt = nil
-        } else if state == "failed" {
-            var detail = "Sign-in failed."
-            if let stage = reply["stage"] as? String, let code = reply["code"] as? String {
-                detail += " (\(stage): \(code))"
+            message = ""
+            deliveryProgressMessage = ""
+            clearProvisioningOutcome()
+        } else if state == "authenticatedProvisioningIncomplete" {
+            // V3_PROVISIONING_TERMINAL_NOT_A_SIGNIN_FAILURE_V1: the terminal
+            // payload carries the classified provisioning problem, which is
+            // retained verbatim. This state is never collapsed into "failed".
+            provisioningIncomplete = true
+            team = reply["team"] as? String ?? team
+            message = "Apple ID signed in successfully."
+            prompt = nil
+            deliveryProgressMessage = ""
+            if let failureKind = reply["failureKind"] as? String {
+                provisioningMessage = V3AuthStore.failureMessage(from: ["kind": failureKind])
+            } else {
+                provisioningMessage = reply["message"] as? String ?? "Provisioning could not be completed."
             }
-            message = detail
+            provisioningStage = reply["stage"] as? String ?? ""
+            provisioningCode = reply["code"] as? String ?? ""
+            provisioningTechnical = reply["technicalDetails"] as? String ?? ""
+            provisioningCorrelation = (reply["failure"] as? [String: Any])?["correlationID"] as? String ?? ""
+            provisioningRetryAvailable = V3ServiceBridge.strictBool(reply["resumable"]) ?? false
+            provisioningSessionUnavailable = false
+            if !provisioningRetryAvailable {
+                provisioningMessage += " The saved provisioning session is not ready to retry yet. Finish Later, then reopen Account & Signing to reload status."
+            }
+            provisioningFinishedLater = false
+        } else if state == "failed" {
+            message = reply["message"] as? String ?? "The sign-in request failed for an unknown reason."
+            if let failure = reply["failure"] as? [String: Any] { previousFailure = failure }
+            prompt = nil
+            deliveryProgressMessage = ""
+            clearProvisioningOutcome()
+        } else if state == "timedOut" {
+            message = reply["message"] as? String ?? "Sign-in timed out. Start a new sign-in when you are ready."
+            prompt = nil
+            deliveryProgressMessage = ""
+            twoFactorTransientStep = nil
+        } else if state == "promptExpired" {
+            message = reply["message"] as? String
+                ?? "That verification session expired. Start a new sign-in to request another verification code."
+            task?.cancel()
+            prompt = nil
+            promptSubmitting = false
+            deliveryProgressMessage = ""
+            twoFactorTransientStep = nil
+        } else if state == "cancelled" {
+            message = "Sign-in was cancelled."
             prompt = nil
         }
     }
 
+    static func failureMessage(from failure: [String: Any]) -> String {
+        // The service classifies the real typed error into a display kind.
+        // Only show password guidance for proven invalid credentials.
+        switch failure["kind"] as? String {
+        case "invalidCredentials": return "Apple did not accept the Apple ID or password. Check them and try again."
+        case "appSpecificPasswordRequired": return "Apple requires an app-specific password for this authentication path."
+        case "invalidCode": return "The verification code was not accepted. Enter a new code and try again."
+        case "rateLimited": return "Too many authentication attempts. Apple is temporarily rate-limiting requests. Wait before trying again."
+        case "serviceUnavailable": return "Apple's authentication service did not return a valid response. Try again later."
+        case "anisetteFailure", "anisette": return "Authentication could not obtain valid Anisette data."
+        case "networkFailure", "network": return "Authentication could not reach the required Apple service. Check the connection and try again."
+        case "accountRepairRequired": return "Apple requires attention on this account before signing in."
+        case "unknown": return "Apple sign-in returned an error that could not be safely classified."
+        case nil: break
+        default: break
+        }
+        let code = failure["code"] as? String ?? ""
+        let stage = failure["stage"] as? String ?? ""
+        switch code {
+        case "invalidCredentials": return "Apple did not accept the Apple ID or password. Check them and try again."
+        case "appSpecificPasswordRequired": return "Apple requires an app-specific password for this authentication path."
+        case "rateLimited": return "Too many authentication attempts. Apple is temporarily rate-limiting requests. Wait before trying again."
+        case "serviceUnavailable": return "Apple's authentication service is temporarily unavailable. Try again later."
+        case "anisetteFailure": return "Authentication could not obtain valid Anisette data."
+        case "networkFailure": return "Authentication could not reach the required Apple service."
+        case "accountRepairRequired": return "Account repair is required. Open the Apple Developer account to resolve."
+        default:
+            let messages = ["authentication": "Apple ID sign-in failed.",
+                           "anisette": "Anisette authentication infrastructure failure.",
+                           "network": "Network error during authentication.",
+                           "accountRepair": "Account repair required."]
+            return messages[stage] ?? "Apple ID sign-in failed."
+        }
+    }
+
+    static func failureDetails(from failure: [String: Any]) -> String {
+        V3AuthFailureDiagnosticsPolicy.render(failure,
+            underlyingCode: V3ServiceBridge.strictInt(failure["underlyingCode"]),
+            retryableValue: V3ServiceBridge.strictBool(failure["retryable"]))
+    }
+
     func answer(promptID: String, answer: [String: String]) {
-        guard let session else { return }
+        guard !promptID.isEmpty, let session,
+              V3AuthPromptResponsePolicy.maySubmit(state: state,
+                currentPromptID: prompt?["id"] as? String, submittedPromptID: promptID,
+                isSubmitting: promptSubmitting, cancellationInProgress: isCancelling) else { return }
+        if promptResponseBlocked && !["cancel", "changeMethod"].contains(answer["action"] ?? "") { return }
+        promptResponseDiagnostics = ""
+        promptResponseBlocked = false
+        promptResponseGeneration &+= 1
+        promptSubmitting = true
+        previousFailure = V3AuthPromptFailurePolicy.clearingAfterSubmission(
+            previousFailure, promptKind: prompt?["kind"] as? String)
+        if prompt?["kind"] as? String == "twoFactor" {
+            switch answer["action"] {
+            case "trustedDevice":
+                twoFactorTransientStep = .deliveryRequested
+                deliveryProgressMessage = "Requesting approval from your trusted devices..."
+            case "sms", "voice":
+                let choices = prompt?["options"] as? [[String: Any]] ?? []
+                let phoneCount = choices.filter { ($0["id"] as? String ?? "").hasPrefix("phone:") }.count
+                if phoneCount > 1 {
+                    twoFactorTransientStep = .choosePhoneNumber
+                    deliveryProgressMessage = "Choose a phone number for this verification request..."
+                } else if answer["action"] == "voice" {
+                    twoFactorTransientStep = .deliveryRequested
+                    deliveryProgressMessage = "Requesting a verification call..."
+                } else {
+                    twoFactorTransientStep = .deliveryRequested
+                    deliveryProgressMessage = "Requesting a verification code by SMS..."
+                }
+            case "code":
+                twoFactorTransientStep = .verifyingCode
+                deliveryProgressMessage = "Verifying code..."
+            case "changeMethod":
+                twoFactorTransientStep = .chooseDeliveryMethod
+                deliveryProgressMessage = "Opening verification methods..."
+            default:
+                if answer["action"]?.hasPrefix("phone:") == true {
+                    let mode = answer["mode"] ?? "sms"
+                    twoFactorTransientStep = .deliveryRequested
+                    deliveryProgressMessage = mode == "voice" ? "Requesting a verification call..." : "Requesting a verification code by SMS..."
+                }
+            }
+        }
         Task {
             do {
                 let reply = try await V3ServiceBridge.shared.request(operation: "authRespond", target: session,
                     payload: ["prompt": promptID, "answer": answer])
+                if V3ServiceBridge.strictBool(reply["responsePending"]) == true {
+                    let replyRevision = V3ServiceBridge.strictInt(reply["revision"])
+                    let replyPromptID = (reply["prompt"] as? [String: Any])?["id"] as? String
+                    if replyPromptID != promptID {
+                        guard V3AuthSessionResponsePolicy.mayApplyReply(
+                            currentSessionID: self.session,
+                            replySessionID: reply["session"] as? String ?? "",
+                            cancellationInProgress: self.isCancelling,
+                            currentRevision: self.revision,
+                            replyRevision: replyRevision) else { return }
+                        self.promptResponseGeneration &+= 1
+                        apply(reply)
+                        return
+                    }
+                    guard V3AuthSessionResponsePolicy.mayApplyReply(
+                        currentSessionID: self.session,
+                        replySessionID: reply["session"] as? String ?? "",
+                        cancellationInProgress: self.isCancelling,
+                        submittedPromptID: promptID,
+                        currentPromptID: self.prompt?["id"] as? String,
+                        currentRevision: self.revision,
+                        replyRevision: replyRevision) else { return }
+                    self.promptResponseGeneration &+= 1
+                    self.revision = replyRevision ?? self.revision
+                    self.promptSubmitting = true
+                    self.deliveryProgressMessage = "Your response is being processed..."
+                    return
+                }
+                if V3ServiceBridge.strictBool(reply["promptExpired"]) == true ||
+                    reply["state"] as? String == "promptExpired" {
+                    guard self.session == session, !self.isCancelling,
+                          self.prompt?["id"] as? String == promptID else { return }
+                    if let replyRevision = V3ServiceBridge.strictInt(reply["revision"]), replyRevision >= revision {
+                        revision = replyRevision
+                    }
+                    state = "promptExpired"
+                    task?.cancel()
+                    promptResponseGeneration &+= 1
+                    promptSubmitting = false
+                    prompt = nil
+                    deliveryProgressMessage = ""
+                    twoFactorTransientStep = nil
+                    message = "That verification session expired. Start a new sign-in to request another verification code."
+                    await reconcile(force: true, expectedSession: session)
+                    return
+                }
+                guard V3AuthSessionResponsePolicy.mayApplyReply(
+                    currentSessionID: self.session,
+                    replySessionID: reply["session"] as? String ?? "",
+                    cancellationInProgress: self.isCancelling,
+                    submittedPromptID: promptID,
+                    currentPromptID: self.prompt?["id"] as? String,
+                    currentRevision: self.revision,
+                    replyRevision: V3ServiceBridge.strictInt(reply["revision"])) else { return }
+                promptResponseGeneration &+= 1
                 apply(reply)
             } catch {
-                state = "failed"
-                message = error.localizedDescription
+                guard V3AuthPromptSubmissionPolicy.mayShowFailure(
+                    currentSessionID: self.session, submittedSessionID: session,
+                    currentPromptID: self.prompt?["id"] as? String,
+                    submittedPromptID: promptID, cancellationInProgress: self.isCancelling) else { return }
+                promptResponseGeneration &+= 1
+                promptSubmitting = false
+                message = V3AuthPromptResponsePolicy.failureMessage(error)
+                promptResponseDiagnostics = V3AuthPromptResponsePolicy.diagnostics(error)
+                promptResponseBlocked = V3AuthPromptResponsePolicy.blocksResubmission(error)
             }
         }
     }
 
+    func clearPreviousFailure() {
+        previousFailure = V3AuthPromptFailurePolicy.clearingOnDismiss(previousFailure)
+    }
+
     func cancel() {
-        task?.cancel()
-        if let session {
-            Task { _ = try? await V3ServiceBridge.shared.request(operation: "authCancel", target: session) }
+        guard !(state == "resultUnknown" && session == nil) else {
+            reloadAuthoritativeAccountStatus()
+            return
         }
-        session = nil
-        state = "cancelled"
-        prompt = nil
-        task = nil
+        let hasActiveAttempt = ["working", "awaitingPrompt", "promptExpired", "resultUnknown"].contains(state)
+        let canRetryCancellation = V3AuthCancellationRetryPolicy.canRetry(
+            isCancelling: isCancelling, cancellationConfirmed: cancellationConfirmed,
+            hasSession: session != nil)
+        guard !isCancelling, hasActiveAttempt || canRetryCancellation else { return }
+        reconciliationGate.invalidate()
+        cancellationWasAttempted = true
+        isCancelling = true
+        cancellationConfirmed = false
+        if let cancellationMessage = V3AuthCancellationFeedbackPolicy.message(isCancelling: true) {
+            message = cancellationMessage
+        }
+        let oldTask = task
+        let oldSession = session
+        task?.cancel()
+        Task { @MainActor in
+            do {
+                var terminalReply: [String: Any]?
+                if let oldSession {
+                    terminalReply = try await V3ServiceBridge.shared.request(operation: "authCancel", target: oldSession)
+                }
+                await oldTask?.value
+                if let terminalReply { apply(terminalReply) }
+                await reconcile(force: true)
+                cancellationConfirmed = true
+                cancellationWasAttempted = false
+                if !signedIn, terminalReply == nil {
+                    state = "cancelled"
+                    message = "Sign-in was cancelled before an authentication session was confirmed."
+                }
+            } catch {
+                await oldTask?.value
+                await reconcile(force: true)
+                state = "resultUnknown"
+                message = signedIn
+                    ? "SideStore currently reports an account as signed in, but could not confirm that the sign-in request stopped. Retry Cancellation before starting another attempt."
+                    : "SideStore could not confirm that the sign-in request stopped. Retry Cancellation before starting another attempt."
+            }
+            session = cancellationConfirmed ? nil : oldSession
+            prompt = nil
+            promptSubmitting = false
+            task = nil
+            isCancelling = false
+        }
     }
 }
 
@@ -1568,6 +5066,7 @@ struct V3SignInLink: View {
 
 struct V3SignInView: View {
     @EnvironmentObject private var status: V3SideStoreStatusStore
+    @EnvironmentObject private var sharedModel: SharedModel
     @StateObject private var auth = V3AuthStore()
     var body: some View {
         List {
@@ -1577,41 +5076,247 @@ struct V3SignInView: View {
                     Spacer()
                     Text(statusText).foregroundColor(.secondary)
                 }
-                if auth.state == "completed" {
+                if auth.isSignedIn {
                     HStack {
-                        Label("Signed in", systemImage: "checkmark.circle.fill")
+                        Label(V3AuthStatusTextPolicy.accountLabel(state: auth.state, isSignedIn: auth.isSignedIn),
+                              systemImage: "checkmark.circle.fill")
                             .foregroundColor(.green)
                         Spacer()
                         if !auth.team.isEmpty { Text(auth.team).foregroundColor(.secondary) }
+                    }
+                    if V3JITLessCompletionPolicy.isRequired(osMajor: ProcessInfo.processInfo.operatingSystemVersion.majorVersion) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Next: Set Up JIT-Less")
+                                .font(.subheadline.weight(.semibold))
+                            Text("LiveContainer needs a JIT-Less certificate configured before guest apps can launch on iOS 26 and later.")
+                                .font(.footnote).foregroundColor(.secondary)
+                            Button("Continue to JIT-Less Setup") { openJITLessSetup() }
+                                .buttonStyle(.borderedProminent)
+                        }
+                        .padding(.vertical, 4)
                     }
                 }
                 if !auth.message.isEmpty {
                     Text(auth.message)
                         .font(.footnote)
-                        .foregroundColor(.red)
+                        .foregroundColor(auth.state == "resultUnknown" || auth.state == "timedOut" ||
+                            auth.state == "cancelled" ? .orange : (auth.isSignedIn ? .green : .red))
                         .textSelection(.enabled)
                 }
-                if auth.state == "idle" || auth.state == "failed" || auth.state == "cancelled" {
-                    Button {
-                        auth.begin()
-                    } label: {
-                        Label(auth.state == "idle" ? "Begin Sign In" : "Try Again", systemImage: "person.badge.key.fill")
+                if V3AuthFailureDiagnosticsPolicy.shouldShowTerminalDetails(
+                    state: auth.state, hasPrompt: auth.prompt != nil,
+                    hasFailure: auth.previousFailure != nil),
+                   let failure = auth.previousFailure {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Sign-in diagnostics")
+                            .font(.subheadline.weight(.semibold))
+                        DisclosureGroup("Technical details") {
+                            Text(V3AuthStore.failureDetails(from: failure))
+                                .font(.caption2)
+                                .textSelection(.enabled)
+                        }
+                        Button("Copy Diagnostics", systemImage: "doc.on.doc") {
+                            UIPasteboard.general.string = V3AuthStore.failureDetails(from: failure)
+                        }
+                        .font(.caption)
+                    }
+                    .padding(.vertical, 4)
+                }
+                if !auth.currentAttemptFailure.message.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Sign-in attempt could not be confirmed")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundColor(.orange)
+                        Text(auth.currentAttemptFailure.message)
+                            .font(.footnote)
+                            .foregroundColor(.orange)
+                            .textSelection(.enabled)
+                        if !auth.currentAttemptFailure.technicalDetails.isEmpty {
+                            DisclosureGroup("Technical details") {
+                                Text(auth.currentAttemptFailure.technicalDetails)
+                                    .font(.caption2)
+                                    .textSelection(.enabled)
+                            }
+                            Button("Copy Diagnostics") {
+                                UIPasteboard.general.string = auth.currentAttemptFailure.technicalDetails
+                            }
+                            .font(.caption)
+                        }
                     }
                 }
-                if auth.state == "working" || auth.state == "awaitingPrompt" {
-                    Button("Cancel Sign In", role: .cancel) { auth.cancel() }
+                // V3_PROVISIONING_NEEDS_ATTENTION_V1: the authenticated fact above
+                // stays green while the provisioning problem is stated separately.
+                if auth.hasProvisioningProblem {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Provisioning needs attention")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundColor(.orange)
+                        Text("Provisioning could not be completed.")
+                            .font(.footnote.weight(.medium))
+                            .foregroundColor(.orange)
+                        Text(auth.provisioningMessage)
+                            .font(.footnote)
+                            .foregroundColor(.orange)
+                            .textSelection(.enabled)
+                        if !auth.provisioningTechnical.isEmpty {
+                            DisclosureGroup("Technical details") {
+                                Text(auth.provisioningTechnical)
+                                    .font(.caption2)
+                                    .textSelection(.enabled)
+                            }
+                            HStack {
+                                Button("Copy Diagnostics") { UIPasteboard.general.string = auth.provisioningTechnical }
+                                    .font(.caption)
+                                Spacer(minLength: 0)
+                            }
+                        }
+                    }
+                }
+                if !auth.deliveryProgressMessage.isEmpty {
+                    Text(auth.deliveryProgressMessage)
+                        .font(.footnote.weight(.medium))
+                        .foregroundColor(.orange)
+                } else if let progress = auth.twoFactorTransientStep?.progressLabel {
+                    Text(progress)
+                        .font(.footnote.weight(.medium))
+                        .foregroundColor(.orange)
+                }
+                if auth.state == "idle" {
+                    Button { auth.begin() } label: {
+                        Label("Begin Sign In", systemImage: "person.badge.key.fill")
+                    }
+                    .disabled(!auth.canBegin)
+                } else if auth.state == "failed" || auth.state == "cancelled" ||
+                    auth.state == "timedOut" || auth.state == "promptExpired" {
+                    switch auth.terminalFailureAction {
+                    case .beginNewSignIn(let title):
+                        Button { auth.begin() } label: {
+                            Label(title, systemImage: "person.badge.key.fill")
+                        }
+                        .disabled(!auth.canBegin)
+                        if let guidance = auth.terminalFailureGuidance {
+                            Text(guidance).font(.caption).foregroundColor(.secondary)
+                        }
+                    case .repairAppleAccount:
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(auth.terminalFailureGuidance ?? "Resolve the account issue shown by Apple before signing in again.")
+                                .font(.footnote).foregroundColor(.orange)
+                            Link("Open Apple Account", destination: URL(string: "https://account.apple.com")!)
+                            Button("Begin Sign-In After Repair") { auth.begin() }
+                                .disabled(!auth.canBegin)
+                        }
+                    case .useAppSpecificPassword:
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(auth.terminalFailureGuidance ?? "Apple requires an app-specific password for this authentication path.")
+                                .font(.footnote).foregroundColor(.orange)
+                            Link("Open Apple Account", destination: URL(string: "https://account.apple.com")!)
+                            Button("Use App-Specific Password") { auth.begin() }
+                                .disabled(!auth.canBegin)
+                        }
+                    case .blocked:
+                        Text(auth.terminalFailureGuidance ?? "This failure is not marked safe to retry. Review Diagnostics before another attempt.")
+                            .font(.footnote).foregroundColor(.orange)
+                    }
+                }
+                if auth.state != "resultUnknown" && V3AuthCancellationRetryPolicy.canRetry(isCancelling: auth.isCancelling,
+                    cancellationConfirmed: auth.cancellationConfirmed,
+                    hasSession: auth.hasSession) {
+                    Button(auth.cancellationWasAttempted ? "Retry Cancellation" : "Cancel Unconfirmed Sign-In",
+                           role: .cancel) { auth.cancel() }
+                }
+                if auth.state == "resultUnknown" {
+                    switch V3AuthUnknownResultRecoveryPolicy.action(
+                        isCancelling: auth.isCancelling,
+                        cancellationConfirmed: auth.cancellationConfirmed,
+                        hasSession: auth.hasSession) {
+                    case .cancelSession:
+                        Button(auth.cancellationWasAttempted ? "Retry Cancellation" : "Cancel Unconfirmed Sign-In",
+                               role: .cancel) { auth.cancel() }
+                            .disabled(auth.isCancelling)
+                    case .reloadStatus:
+                        Button(auth.isCancelling ? "Checking..." : "Reload Status") {
+                            auth.reloadAuthoritativeAccountStatus()
+                        }
+                        .disabled(auth.isCancelling)
+                    case .none:
+                        EmptyView()
+                    }
+                }
+                if !V3AuthCancellationRetryPolicy.canRetry(isCancelling: auth.isCancelling,
+                    cancellationConfirmed: auth.cancellationConfirmed,
+                    hasSession: auth.hasSession) &&
+                    (auth.state == "working" || auth.state == "awaitingPrompt" ||
+                     auth.state == "promptExpired") {
+                    Button(auth.isCancelling ? "Cancelling..." : "Cancel Sign In",
+                        role: .cancel) { auth.cancel() }
+                        .disabled(auth.isCancelling)
+                }
+                // V3_PROVISIONING_RECOVERY_ACTIONS_V1: the actions describe the
+                // provisioning state, not a failed sign-in. "Retry" re-enters
+                // provisioning with the saved session; "Finish Later" keeps the
+                // authenticated account and closes this flow.
+                if auth.hasProvisioningProblem {
+                    let recovery = V3AuthProvisioningRecoveryPolicy.resolve(
+                        state: auth.state, hasSession: auth.hasSession, signedIn: auth.isSignedIn,
+                        provisioningRetryAvailable: auth.provisioningRetryAvailable,
+                        isCancelling: auth.isCancelling,
+                        cancellationConfirmed: auth.cancellationConfirmed,
+                        authenticationActive: auth.provisioningRetryBlockedByActiveSession)
+                    if recovery.showCancellationInstruction {
+                        Text("Cancel the unconfirmed sign-in before retrying provisioning.")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                    if recovery.showRetryProvisioning || auth.state != "resultUnknown" {
+                        Button {
+                            auth.retryProvisioning()
+                        } label: {
+                            Label("Retry Provisioning", systemImage: "arrow.clockwise")
+                        }
+                        .disabled(!auth.canRetryProvisioning)
+                    }
+                    if auth.provisioningSessionUnavailable {
+                        Text("Finish Later, then reopen Account & Signing to sign in again before retrying provisioning.")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                    if recovery.blockedByActiveSession {
+                        Text("Another sign-in or provisioning attempt is still active. Wait for it to finish, then reload status.")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                    if recovery.showFinishLater {
+                        Button("Finish Later") { finishProvisioningLater() }
+                    }
                 }
             }
             if let prompt = auth.prompt {
-                if auth.attempts > 1 && (prompt["kind"] as? String == "credentials") {
+                if V3AuthPromptFailurePolicy.isVisible(auth.previousFailure, promptKind: prompt["kind"] as? String),
+                   let previousFailure = auth.previousFailure {
                     Section {
-                        Text("That was not accepted. Check the Apple ID and password, then submit again.")
-                            .font(.footnote)
-                            .foregroundColor(.orange)
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(V3AuthStore.failureMessage(from: previousFailure))
+                                .font(.footnote)
+                                .foregroundColor(.orange)
+                            Text(V3AuthStore.failureDetails(from: previousFailure))
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
                     }
                 }
-                V3PromptSection(prompt: prompt) { answer in
+                V3PromptSection(prompt: prompt, isSubmitting: $auth.promptSubmitting,
+                    isSubmissionBlocked: auth.promptResponseBlocked && (prompt["kind"] as? String == "twoFactor")) { answer in
                     auth.answer(promptID: prompt["id"] as? String ?? "", answer: answer)
+                }
+                if !auth.promptResponseDiagnostics.isEmpty {
+                    Section("Verification response") {
+                        DisclosureGroup("Technical details") {
+                            Text(auth.promptResponseDiagnostics)
+                                .font(.caption2)
+                                .textSelection(.enabled)
+                        }
+                        Button("Copy Diagnostics", systemImage: "doc.on.doc") {
+                            UIPasteboard.general.string = auth.promptResponseDiagnostics
+                        }
+                        .font(.caption)
+                    }
                 }
             }
             Section("About") {
@@ -1622,20 +5327,36 @@ struct V3SignInView: View {
         }
         .listStyle(.insetGrouped)
         .navigationTitle("Sign In")
-        .task { auth.begin() }
+        .task { await auth.reconcile() }
         .onDisappear {
             auth.cancel()
+            auth.clearPreviousFailure()
             status.reload()
         }
     }
     private var statusText: String {
-        switch auth.state {
-        case "completed": return "Signed in"
-        case "awaitingPrompt": return "Needs your input"
-        case "failed": return "Failed"
-        case "cancelled": return "Cancelled"
-        case "working": return "Working..."
-        default: return "Not started"
+        V3AuthCancellationFeedbackPolicy.statusLabel(isCancelling: auth.isCancelling,
+            normalLabel: V3AuthStatusTextPolicy.label(state: auth.state, isSignedIn: auth.isSignedIn,
+                provisioningFinishedLater: auth.provisioningFinishedLater))
+    }
+
+    // V3_FINISH_LATER_PRESERVES_ACCOUNT_V1: closing the flow reloads the
+    // authoritative SideStore snapshot so the account is shown as signed in
+    // again. It never signs out and never discards the saved session.
+    private func finishProvisioningLater() {
+        auth.finishProvisioningLater()
+        status.reload()
+    }
+
+    private func openJITLessSetup() {
+        if status.setupPresented || status.signInPresented {
+            status.pendingCanonicalJITLessSetup = true
+            status.returnToSetupAfterJITLess = status.setupPresented
+            status.setupPresented = false
+            status.signInPresented = false
+        } else {
+            sharedModel.selectedTab = .settings
+            sharedModel.deepLink = URL(string: "livecontainer://jitless-setup")
         }
     }
 }
@@ -1662,12 +5383,20 @@ struct V3CertificatesView: View {
     @State private var loading = true
     @State private var portalLoaded = false
     @State private var message = ""
+    @State private var notice = ""
+    @State private var busy = ""
+    @State private var loadingRequest = false
     @State private var confirm: (String, String)?
     var body: some View {
         List {
             if !message.isEmpty {
                 Section {
                     Text(message).font(.footnote).foregroundColor(.red).textSelection(.enabled)
+                }
+            }
+            if !notice.isEmpty {
+                Section {
+                    Text(notice).font(.footnote).foregroundColor(.secondary)
                 }
             }
             if status.needsSignIn {
@@ -1693,12 +5422,14 @@ struct V3CertificatesView: View {
                         }
                         HStack {
                             if !cert.active {
-                                Button("Set Active") { setActive(serial: cert.serial) }
+                                Button(busy == cert.serial ? "Working..." : "Set Active") { setActive(serial: cert.serial) }
                                     .font(.caption)
+                                    .disabled(!busy.isEmpty)
                             }
                             Spacer()
                             Button("Delete", role: .destructive) { confirm = ("delete", cert.serial) }
                                 .font(.caption)
+                                .disabled(!busy.isEmpty)
                         }
                     }
                     .padding(.vertical, 4)
@@ -1706,7 +5437,8 @@ struct V3CertificatesView: View {
             }
             Section("Developer Portal") {
                 if !portalLoaded {
-                    Button("Load Portal Certificates") { Task { await loadPortal() } }
+                    Button(busy == "portal" ? "Loading Portal Certificates..." : "Load Portal Certificates") { Task { await loadPortal() } }
+                        .disabled(!busy.isEmpty)
                 } else {
                     ForEach(portal) { cert in
                         VStack(alignment: .leading, spacing: 4) {
@@ -1718,10 +5450,12 @@ struct V3CertificatesView: View {
                             }
                             Button("Revoke", role: .destructive) { confirm = ("revoke", cert.serial) }
                                 .font(.caption)
+                                .disabled(!busy.isEmpty)
                         }
                         .padding(.vertical, 4)
                     }
                     Button("Request New Certificate") { confirm = ("create", "") }
+                        .disabled(!busy.isEmpty)
                 }
             }
         }
@@ -1738,33 +5472,45 @@ struct V3CertificatesView: View {
         }
     }
     private func reload() async {
+        guard !loadingRequest else { return }
+        loadingRequest = true
         loading = true
-        defer { loading = false }
+        defer { loading = false; loadingRequest = false }
         do {
             let reply = try await V3ServiceBridge.shared.request(operation: "certList")
             local = (reply["certificates"] as? [[String: Any]] ?? []).compactMap(V3CertificateRow.init)
             message = ""
-        } catch { message = error.localizedDescription }
+        } catch { message = V3FailureGuidance.message(error) }
     }
     private func loadPortal() async {
+        busy = "portal"
+        notice = ""
+        defer { busy = "" }
         do {
             let reply = try await V3ServiceBridge.shared.request(operation: "certPortalList")
             portal = (reply["certificates"] as? [[String: Any]] ?? []).compactMap(V3CertificateRow.init)
             portalLoaded = true
             message = ""
-        } catch { message = error.localizedDescription }
+        } catch { message = V3FailureGuidance.message(error) }
     }
     private func setActive(serial: String) {
+        busy = serial
+        notice = ""
         Task {
+            defer { busy = "" }
             do {
                 _ = try await V3ServiceBridge.shared.request(operation: "certSetActive", target: serial)
                 status.reload()
                 await reload()
-            } catch { message = error.localizedDescription }
+                notice = "Active certificate updated."
+            } catch { message = V3FailureGuidance.message(error) }
         }
     }
     private func runConfirmed(action: String, serial: String) async {
         confirm = nil
+        busy = action + serial
+        notice = ""
+        defer { busy = "" }
         do {
             switch action {
             case "delete": _ = try await V3ServiceBridge.shared.request(operation: "certDelete", target: serial)
@@ -1775,7 +5521,12 @@ struct V3CertificatesView: View {
             await reload()
             portalLoaded = false
             message = ""
-        } catch { message = error.localizedDescription }
+            switch action {
+            case "delete": notice = "Certificate deleted."
+            case "revoke": notice = "Certificate revoked."
+            default: notice = "Certificate requested."
+            }
+        } catch { message = V3FailureGuidance.message(error) }
     }
 }
 
@@ -1788,6 +5539,7 @@ struct V3DeveloperServicesView: View {
     @State private var profiles: [[String: Any]] = []
     @State private var message = ""
     @State private var loading = true
+    @State private var loadingRequest = false
     var body: some View {
         List {
             if !message.isEmpty {
@@ -1800,7 +5552,9 @@ struct V3DeveloperServicesView: View {
             }
             Section("Actions") {
                 Button { status.syncAppIDs() } label: { Label("Sync App IDs", systemImage: "arrow.triangle.2.circlepath") }
-                Button("Reload Developer Data") { Task { await reload() } }
+                    .disabled(status.loading)
+                Button(loading ? "Loading Developer Data..." : "Reload Developer Data") { Task { await reload() } }
+                    .disabled(loading)
             }
             simpleSection("Teams", rows: teams.map { "\($0["name"] ?? "") (\($0["identifier"] ?? ""))" })
             simpleSection("Devices", rows: devices.map { "\($0["name"] ?? "") · \($0["identifier"] ?? "")" })
@@ -1844,8 +5598,10 @@ struct V3DeveloperServicesView: View {
         }
     }
     private func reload() async {
+        guard !loadingRequest else { return }
+        loadingRequest = true
         loading = true
-        defer { loading = false }
+        defer { loading = false; loadingRequest = false }
         do {
             async let teamsReply = V3ServiceBridge.shared.request(operation: "devTeams")
             async let devicesReply = V3ServiceBridge.shared.request(operation: "devDevices")
@@ -1860,7 +5616,7 @@ struct V3DeveloperServicesView: View {
             groups = strings(groupsResult, key: "groups")
             profiles = profilesResult["profiles"] as? [[String: Any]] ?? []
             message = ""
-        } catch { message = error.localizedDescription }
+        } catch { message = V3FailureGuidance.message(error) }
     }
 }
 
@@ -1900,6 +5656,7 @@ struct V3PairingView: View {
     @EnvironmentObject private var status: V3SideStoreStatusStore
     @State private var pickerPresented = false
     @State private var message = ""
+    @State private var pairingFailure: CombinedFailure?
     @State private var working = false
     var body: some View {
         List {
@@ -1913,14 +5670,78 @@ struct V3PairingView: View {
                     Text(message).font(.footnote).foregroundColor(.red).textSelection(.enabled)
                 }
             }
+            if let failure = pairingFailure {
+                Section("Pairing file could not be read or validated") {
+                    Text(failure.safeMessage)
+                        .font(.footnote)
+                        .foregroundColor(.red)
+                        .textSelection(.enabled)
+                    Text("What you can do")
+                        .font(.caption.weight(.semibold))
+                    Text(failure.recovery)
+                        .font(.footnote)
+                    DisclosureGroup("Technical details") {
+                        Text(failure.technicalDetails)
+                            .font(.caption2)
+                            .textSelection(.enabled)
+                    }
+                    Button("Copy Diagnostics", systemImage: "doc.on.doc") {
+                        UIPasteboard.general.string = failure.technicalDetails
+                    }
+                    if V3PairingImportFailurePolicy.shouldOfferFileRetry(operation: failure.operation,
+                            stage: failure.stage.rawValue, safeCause: failure.safeCause?.rawValue) {
+                        Button("Choose Pairing File Again") { pickerPresented = true }
+                    }
+                }
+            }
+            // V3_PAIRING_PLACEMENT_FIRST_V1: the pairing mechanism works. The
+            // normal installation workflow places the pairing file with the tool
+            // that installed LC+SS, so that is the recommended path. Manual import
+            // remains available as a clearly secondary fallback.
+            if pairingMissing {
+                Section("Pairing File Required") {
+                    Text("Recommended setup")
+                        .font(.footnote.weight(.semibold))
+                    Text("If you installed with iLoader:")
+                        .font(.footnote).foregroundColor(.secondary)
+                    ForEach(Array(Self.pairingPlacementSteps.enumerated()), id: \.offset) { index, step in
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Text("\(index + 1).").font(.caption).foregroundColor(.secondary)
+                            Text(step).font(.footnote)
+                        }
+                    }
+                    Text("Other installation tools use different menu names, but they all place the pairing file for the installed app.")
+                        .font(.caption).foregroundColor(.secondary)
+                    Button {
+                        recheck()
+                    } label: {
+                        Label("Re-check Pairing", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(working)
+                }
+            } else {
+                Section("Pairing File Ready") {
+                    Text("A valid pairing file is available. Re-check if you replace the file or reset the device.")
+                        .font(.footnote).foregroundColor(.secondary)
+                    Button {
+                        recheck()
+                    } label: {
+                        Label("Re-check Pairing", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(working)
+                }
+            }
+            // V3_PAIRING_IMPORT_IS_FALLBACK_V1: kept, presented as an alternative.
             Section {
+                Text("Alternative: Import Pairing File Manually")
+                    .font(.footnote.weight(.semibold))
                 Button {
                     pickerPresented = true
                 } label: {
-                    Label(working ? "Importing..." : "Select Pairing File", systemImage: "doc.badge.plus")
+                    Label(working ? "Importing..." : "Import Pairing File Manually", systemImage: "doc.badge.plus")
                 }
                 .disabled(working)
-                Text("Pick a .mobiledevicepairing or .plist file. This screen owns the picker; the service only validates and stores the file.")
+                Text("Use this only if the placement tool did not work. Pick a .mobiledevicepairing or .plist file. This screen owns the picker; the service only validates and stores the file.")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -1934,8 +5755,35 @@ struct V3PairingView: View {
             }
         }
     }
+    // V3_PAIRING_PLACEMENT_STEPS_V1: the documented iLoader placement flow.
+    // It is presented as "If you installed with iLoader", because other
+    // third-party installers do not necessarily use the same menu names.
+    static let pairingPlacementSteps = [
+        "Connect the iPhone to the computer if your installation tool requires it.",
+        "Open the tool you used to install LC+SS.",
+        "Open Management.",
+        "Open Manage Pairing File.",
+        "If LC+SS is not listed, use Rescan Installed Apps.",
+        "Find the installed LC+SS app.",
+        "Choose Place for this app.",
+        "Wait for the tool to confirm success.",
+        "Return to LC+SS."
+    ]
+
+    // V3_REFRESH_PREREQUISITE_POLICY_V1: one interpretation, shared with every
+    // refresh entry point.
+    private var pairingMissing: Bool {
+        V3RefreshPrerequisite.evaluate(pairingStatus: status.pairing).blocksRefresh
+    }
+
+    private func recheck() {
+        status.reload()
+    }
+
     private func importFile(_ url: URL) async {
         working = true
+        message = ""
+        pairingFailure = nil
         defer { working = false }
         do {
             let scoped = url.startAccessingSecurityScopedResource()
@@ -1945,7 +5793,18 @@ struct V3PairingView: View {
             _ = try await V3ServiceBridge.shared.request(operation: "pairingImportData", target: token)
             message = ""
             status.reload()
-        } catch { message = error.localizedDescription }
+        } catch {
+            if let failure = error as? CombinedFailure {
+                if V3PairingImportFailurePolicy.shouldOfferFileRetry(operation: failure.operation,
+                        stage: failure.stage.rawValue, safeCause: failure.safeCause?.rawValue) {
+                    pairingFailure = failure
+                } else {
+                    status.present(failure)
+                }
+            } else {
+                message = V3FailureGuidance.message(error)
+            }
+        }
     }
 }
 
@@ -1956,41 +5815,117 @@ final class V3SettingsStore: ObservableObject {
     @Published var ints: [String: Int] = [:]
     @Published var loaded = false
     @Published var message = ""
+    private var writeGenerations = V3SettingsWriteGeneration()
+    private var loadingRequest = false
+    private var confirmedBools: [String: Bool] = [:]
+    private var confirmedStrings: [String: String] = [:]
+    private var confirmedInts: [String: Int] = [:]
     func load() async {
+        guard !loadingRequest else { return }
+        loadingRequest = true
+        defer { loadingRequest = false }
         do {
             let reply = try await V3ServiceBridge.shared.request(operation: "settingsGet")
             bools = reply["bools"] as? [String: Bool] ?? [:]
             strings = reply["strings"] as? [String: String] ?? [:]
             ints = reply["ints"] as? [String: Int] ?? [:]
+            confirmedBools = bools
+            confirmedStrings = strings
+            confirmedInts = ints
             loaded = true
             message = ""
-        } catch { message = error.localizedDescription }
+        } catch { message = V3FailureGuidance.message(error) }
     }
     func setBool(_ key: String, _ value: Bool) {
+        let generation = writeGenerations.begin(key)
         bools[key] = value
         Task {
             do {
                 _ = try await V3ServiceBridge.shared.request(operation: "settingsSet",
                     payload: ["key": key, "type": "bool", "bool": value])
-            } catch { message = error.localizedDescription }
+                if writeGenerations.isCurrent(generation, for: key) {
+                    confirmedBools[key] = value
+                } else {
+                    _ = await reloadAuthoritative(key: key, type: "bool", generation: writeGenerations.current(for: key))
+                }
+            } catch {
+                guard writeGenerations.isCurrent(generation, for: key) else { return }
+                let loaded = await reloadAuthoritative(key: key, type: "bool", generation: generation)
+                if !loaded, writeGenerations.isCurrent(generation, for: key) {
+                    if let confirmed = confirmedBools[key] { bools[key] = confirmed }
+                    else { bools.removeValue(forKey: key) }
+                }
+                message = V3FailureGuidance.message(error)
+            }
         }
     }
     func setString(_ key: String, _ value: String) {
+        let generation = writeGenerations.begin(key)
         strings[key] = value
         Task {
             do {
                 _ = try await V3ServiceBridge.shared.request(operation: "settingsSet",
                     payload: ["key": key, "type": "string", "string": value])
-            } catch { message = error.localizedDescription }
+                if writeGenerations.isCurrent(generation, for: key) {
+                    confirmedStrings[key] = value
+                } else {
+                    _ = await reloadAuthoritative(key: key, type: "string", generation: writeGenerations.current(for: key))
+                }
+            } catch {
+                guard writeGenerations.isCurrent(generation, for: key) else { return }
+                let loaded = await reloadAuthoritative(key: key, type: "string", generation: generation)
+                if !loaded, writeGenerations.isCurrent(generation, for: key) {
+                    if let confirmed = confirmedStrings[key] { strings[key] = confirmed }
+                    else { strings.removeValue(forKey: key) }
+                }
+                message = V3FailureGuidance.message(error)
+            }
         }
     }
     func setInt(_ key: String, _ value: Int) {
+        let generation = writeGenerations.begin(key)
         ints[key] = value
         Task {
             do {
                 _ = try await V3ServiceBridge.shared.request(operation: "settingsSet",
                     payload: ["key": key, "type": "int", "int": value])
-            } catch { message = error.localizedDescription }
+                if writeGenerations.isCurrent(generation, for: key) {
+                    confirmedInts[key] = value
+                } else {
+                    _ = await reloadAuthoritative(key: key, type: "int", generation: writeGenerations.current(for: key))
+                }
+            } catch {
+                guard writeGenerations.isCurrent(generation, for: key) else { return }
+                let loaded = await reloadAuthoritative(key: key, type: "int", generation: generation)
+                if !loaded, writeGenerations.isCurrent(generation, for: key) {
+                    if let confirmed = confirmedInts[key] { ints[key] = confirmed }
+                    else { ints.removeValue(forKey: key) }
+                }
+                message = V3FailureGuidance.message(error)
+            }
+        }
+    }
+    private func reloadAuthoritative(key: String, type: String, generation: UInt64) async -> Bool {
+        do {
+            let reply = try await V3ServiceBridge.shared.request(operation: "settingsGet")
+            guard writeGenerations.isCurrent(generation, for: key) else { return false }
+            switch type {
+            case "bool":
+                let values = reply["bools"] as? [String: Bool] ?? [:]
+                if let value = values[key] { bools[key] = value; confirmedBools[key] = value }
+                else { bools.removeValue(forKey: key); confirmedBools.removeValue(forKey: key) }
+            case "string":
+                let values = reply["strings"] as? [String: String] ?? [:]
+                if let value = values[key] { strings[key] = value; confirmedStrings[key] = value }
+                else { strings.removeValue(forKey: key); confirmedStrings.removeValue(forKey: key) }
+            default:
+                let values = reply["ints"] as? [String: Int] ?? [:]
+                if let value = values[key] { ints[key] = value; confirmedInts[key] = value }
+                else { ints.removeValue(forKey: key); confirmedInts.removeValue(forKey: key) }
+            }
+            return true
+        } catch {
+            return false
         }
     }
 }
@@ -2028,6 +5963,9 @@ struct V3TextRow: View {
                 seeded = true
             }
         }
+        .onChange(of: store.strings[key]) { current in
+            if let current { text = current; seeded = true }
+        }
     }
 }
 
@@ -2054,7 +5992,7 @@ struct V3ConnectionView: View {
                 }
                 .padding(.vertical, 2)
                 .onReceive(store.$ints) { ints in
-                    if let value = ints["remotePairingPortOverride"], port.isEmpty {
+                    if let value = ints["remotePairingPortOverride"] {
                         port = String(value)
                     }
                 }
@@ -2081,10 +6019,15 @@ struct V3AnisetteView: View {
     @StateObject private var store = V3SettingsStore()
     @State private var servers: [V3AnisetteServerRow] = []
     @State private var message = ""
+    @State private var notice = ""
+    @State private var remoteBusy = false
     var body: some View {
         List {
             if !message.isEmpty {
                 Section { Text(message).font(.footnote).foregroundColor(.red).textSelection(.enabled) }
+            }
+            if !notice.isEmpty {
+                Section { Text(notice).font(.footnote).foregroundColor(.secondary) }
             }
             if !store.message.isEmpty {
                 Section { Text(store.message).font(.footnote).foregroundColor(.red) }
@@ -2110,9 +6053,11 @@ struct V3AnisetteView: View {
                     .padding(.vertical, 2)
                 }
                 HStack {
-                    Button("Sync with Remote") { Task { await remote("anisetteSync") } }
+                    Button(remoteBusy ? "Working..." : "Sync with Remote") { Task { await remote("anisetteSync") } }
+                        .disabled(remoteBusy)
                     Spacer()
                     Button("Reset to Defaults", role: .destructive) { Task { await remote("anisetteReset") } }
+                        .disabled(remoteBusy)
                 }
                 .font(.caption)
             }
@@ -2136,14 +6081,18 @@ struct V3AnisetteView: View {
             let reply = try await V3ServiceBridge.shared.request(operation: "anisetteList")
             servers = (reply["servers"] as? [[String: Any]] ?? []).compactMap(V3AnisetteServerRow.init)
             message = ""
-        } catch { message = error.localizedDescription }
+        } catch { message = V3FailureGuidance.message(error) }
     }
     private func remote(_ operation: String) async {
+        remoteBusy = true
+        notice = ""
+        defer { remoteBusy = false }
         do {
             let reply = try await V3ServiceBridge.shared.request(operation: operation)
             servers = (reply["servers"] as? [[String: Any]] ?? []).compactMap(V3AnisetteServerRow.init)
             message = ""
-        } catch { message = error.localizedDescription }
+            notice = operation == "anisetteReset" ? "Anisette servers reset." : "Anisette servers synced."
+        } catch { message = V3FailureGuidance.message(error) }
     }
 }
 
@@ -2151,6 +6100,9 @@ struct V3SideSignView: View {
     @EnvironmentObject private var status: V3SideStoreStatusStore
     @State private var config = ""
     @State private var message = ""
+    @State private var notice = ""
+    @State private var busy = false
+    @State private var exporting = false
     @State private var pickerPresented = false
     @State private var shareItems: [Any]?
     var body: some View {
@@ -2158,20 +6110,27 @@ struct V3SideSignView: View {
             if !message.isEmpty {
                 Section { Text(message).font(.footnote).foregroundColor(.red).textSelection(.enabled) }
             }
+            if !notice.isEmpty {
+                Section { Text(notice).font(.footnote).foregroundColor(.secondary) }
+            }
             Section("Configuration JSON") {
                 TextEditor(text: $config)
                     .font(.system(.caption, design: .monospaced))
                     .frame(minHeight: 220)
                 HStack {
-                    Button("Save") { Task { await save() } }
+                    Button(busy ? "Saving..." : "Save") { Task { await save() } }
+                        .disabled(busy)
                     Spacer()
                     Button("Reset to Defaults", role: .destructive) { Task { await remote("sidesignReset") } }
+                        .disabled(busy)
                 }
                 .font(.caption)
             }
             Section("Import / Export") {
                 Button("Import from File") { pickerPresented = true }
-                Button("Export to File") { Task { await exportConfig() } }
+                    .disabled(busy)
+                Button(exporting ? "Exporting..." : "Export to File") { Task { await exportConfig() } }
+                    .disabled(busy || exporting)
                 Text("The picker belongs to this screen; the service only parses and stores the file.")
                     .font(.caption)
                     .foregroundColor(.secondary)
@@ -2195,23 +6154,34 @@ struct V3SideSignView: View {
             let reply = try await V3ServiceBridge.shared.request(operation: "sidesignGet")
             config = reply["config"] as? String ?? "{}"
             message = ""
-        } catch { message = error.localizedDescription }
+        } catch { message = V3FailureGuidance.message(error) }
     }
     private func save() async {
+        busy = true
+        notice = ""
+        defer { busy = false }
         do {
             let reply = try await V3ServiceBridge.shared.request(operation: "sidesignSet", payload: ["config": config])
             config = reply["config"] as? String ?? config
             message = ""
-        } catch { message = error.localizedDescription }
+            notice = "Configuration saved."
+        } catch { message = V3FailureGuidance.message(error) }
     }
     private func remote(_ operation: String) async {
+        busy = true
+        notice = ""
+        defer { busy = false }
         do {
             let reply = try await V3ServiceBridge.shared.request(operation: operation)
             config = reply["config"] as? String ?? config
             message = ""
-        } catch { message = error.localizedDescription }
+            notice = "Configuration reset."
+        } catch { message = V3FailureGuidance.message(error) }
     }
     private func importFile(_ url: URL) async {
+        busy = true
+        notice = ""
+        defer { busy = false }
         do {
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
@@ -2220,16 +6190,20 @@ struct V3SideSignView: View {
             let reply = try await V3ServiceBridge.shared.request(operation: "sidesignImport", target: token)
             config = reply["config"] as? String ?? config
             message = ""
-        } catch { message = error.localizedDescription }
+            notice = "Configuration imported."
+        } catch { message = V3FailureGuidance.message(error) }
     }
     private func exportConfig() async {
+        guard !busy, !exporting else { return }
+        exporting = true
+        defer { exporting = false }
         do {
             let reply = try await V3ServiceBridge.shared.request(operation: "sidesignExport")
             let text = reply["config"] as? String ?? "{}"
             let url = FileManager.default.temporaryDirectory.appendingPathComponent("sidesign-config.json")
             try text.write(to: url, atomically: true, encoding: .utf8)
             shareItems = [url]
-        } catch { message = error.localizedDescription }
+        } catch { message = V3FailureGuidance.message(error) }
     }
 }
 
@@ -2276,16 +6250,105 @@ struct V3CustomizationsView: View {
     }
 }
 
+
+private struct V3PKCS12CertificateFacts {
+    let teamIdentifier: String
+    let identitySHA256: String
+}
+
+private struct V3JITLessStatusResult {
+    let readiness: V3JITLessReadiness
+    let detail: String
+    let hasImportedCopy: Bool
+    let certificateFacts: V3PKCS12CertificateFacts?
+}
+
+private enum V3JITLessStatusReader {
+    static func read(serviceCertificate: [String: Any]) async -> V3JITLessStatusResult {
+        let osMajor = ProcessInfo.processInfo.operatingSystemVersion.majorVersion
+        let active = serviceCertificate["active"] as? Bool ?? false
+        let activeStatus = serviceCertificate["validation"] as? String ?? "unknown"
+        let activeFingerprint = serviceCertificate["certificateIdentitySHA256"] as? String ?? ""
+        let data = LCUtils.certificateData() as Data?
+        let password = LCSharedUtils.certificatePassword()
+        let facts = data.flatMap { bytes in password.flatMap { parse(bytes, password: $0) } }
+        let identitiesMatch: Bool? = {
+            guard active, !activeFingerprint.isEmpty, let facts else { return nil }
+            return activeFingerprint == facts.identitySHA256
+        }()
+        var validationStatus: Int?
+        var validationFailed = false
+        if data != nil && password != nil {
+            let validation = await validateLocalCopy()
+            validationStatus = validation.status
+            validationFailed = validation.failed
+        }
+        let state = V3JITLessReadinessPolicy.evaluate(
+            osMajor: osMajor,
+            hasCopy: data != nil && password != nil && facts != nil,
+            activeCertificateExists: active,
+            activeCertificateStatus: activeStatus,
+            identitiesMatch: identitiesMatch,
+            validationStatus: validationStatus,
+            validationFailed: validationFailed)
+        if osMajor >= 26 && !active {
+            return V3JITLessStatusResult(readiness: state,
+                detail: V3JITLessPresentation.present(.activeCertificateMissing).detail,
+                hasImportedCopy: data != nil, certificateFacts: facts)
+        }
+        return V3JITLessStatusResult(readiness: state, detail: detail(for: state),
+            hasImportedCopy: data != nil, certificateFacts: facts)
+    }
+
+    static func parse(_ data: Data, password: String) -> V3PKCS12CertificateFacts? {
+        var importedItems: CFArray?
+        let options = [kSecImportExportPassphrase as String: password] as CFDictionary
+        guard SecPKCS12Import(data as CFData, options, &importedItems) == errSecSuccess,
+              let item = (importedItems as? [[String: Any]])?.first,
+              let identityValue = item[kSecImportItemIdentity as String] else { return nil }
+        let identityObject = identityValue as AnyObject
+        guard CFGetTypeID(identityObject as CFTypeRef) == SecIdentityGetTypeID() else { return nil }
+        let identity = unsafeBitCast(identityObject, to: SecIdentity.self)
+        var certificate: SecCertificate?
+        guard SecIdentityCopyCertificate(identity, &certificate) == errSecSuccess,
+              let certificate,
+              let team = LCUtils.getCertTeamId(withKeyData: data, password: password) else { return nil }
+        let der = SecCertificateCopyData(certificate) as Data
+        let fingerprint = SHA256.hash(data: der).map { String(format: "%02x", $0) }.joined()
+        return V3PKCS12CertificateFacts(teamIdentifier: team, identitySHA256: fingerprint)
+    }
+
+    private static func validateLocalCopy() async -> (status: Int?, failed: Bool) {
+        await withCheckedContinuation { (continuation: CheckedContinuation<(Int?, Bool), Never>) in
+            LCUtils.validateCertificate { status, _, _, error in
+                continuation.resume(returning: (Int(status), error != nil))
+            }
+        }
+    }
+
+    private static func detail(for state: V3JITLessReadiness) -> String {
+        // V3_JITLESS_PRESENTATION_V1: one source of truth for the wording, so
+        // Setup Assistant, Health and Settings cannot describe the same state
+        // three different ways.
+        V3JITLessPresentation.present(state).detail
+    }
+}
+
 struct V3HealthView: View {
     @EnvironmentObject private var status: V3SideStoreStatusStore
+    @EnvironmentObject private var sharedModel: SharedModel
     @State private var rows: [(String, String)] = []
+    @State private var certRows: [(String, String)] = []
     @State private var message = ""
+    @State private var jitlessReadiness: V3JITLessReadiness = .unknown
+    @State private var jitlessDetail = "Checking"
+    @State private var activeCertificateAvailable = false
+    @State private var checking = false
+
     var body: some View {
         List {
             if status.needsSignIn {
-                Section {
-                    V3SignInLink(title: "Sign In to Check Account Health")
-                }
+                Section { V3SignInLink(title: "Sign In to Check Account Health") }
             }
             if !message.isEmpty {
                 Section { Text(message).font(.footnote).foregroundColor(.red).textSelection(.enabled) }
@@ -2301,14 +6364,87 @@ struct V3HealthView: View {
                 }
             }
             Section {
-                Button("Re-check") { Task { await reload() } }
+                Button(checking ? "Checking..." : "Re-check") { Task { await reload() } }
+                    .disabled(checking)
+            }
+            Section("Certificates") {
+                ForEach(certRows, id: \.0) { row in
+                    HStack {
+                        Text(row.0)
+                        Spacer()
+                        Text(row.1).foregroundColor(.secondary).multilineTextAlignment(.trailing)
+                    }
+                    .font(.subheadline)
+                }
+                Text("SideStore uses its active certificate for signing, refresh, and installation. LiveContainer keeps a separate JIT-Less certificate copy. JIT-Less certificate status does not by itself mean SideStore refresh used that copy.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            Section("JIT-Less Mode") {
+                HStack {
+                    Text("Status")
+                    Spacer()
+                    Text(jitlessDetail).foregroundColor(.secondary).multilineTextAlignment(.trailing)
+                }
+                if V3JITLessCompletionPolicy.isRequired(osMajor: ProcessInfo.processInfo.operatingSystemVersion.majorVersion) {
+                    // V3_JITLESS_PRESENTATION_V1: Health renders the same shared
+                    // presentation as Setup Assistant, and adds the certificate
+                    // action that actually resolves each distinct state.
+                    let jitless = V3JITLessPresentation.present(jitlessReadiness)
+                    Label(jitless.title, systemImage: jitless.icon)
+                        .font(.footnote)
+                        .foregroundColor(jitless.tint)
+                    if !jitless.isOutstandingSetupTask {
+                        Button("Open JIT-Less Diagnose") { openJITLessDiagnose() }
+                            .font(.caption)
+                    } else {
+                        switch jitlessReadiness {
+                        case .setupRequired, .needsCertificateRefresh, .certificateMismatch, .revoked:
+                            Button(jitlessReadiness == .setupRequired
+                                   ? "Set Up JIT-Less" : "Refresh JIT-Less Certificate") {
+                                openJITLessSetup()
+                            }
+                        case .certificateImported:
+                            // The copy exists but validation is not conclusive, so
+                            // the canonical setup flow is still the useful action.
+                            if activeCertificateAvailable {
+                                Button("Open JIT-Less Setup") { openJITLessSetup() }
+                            }
+                            Button("Open Certificates") { status.certificatesPresented = true }
+                        case .unknown:
+                            if V3JITLessHealthRecoveryPolicy.shouldOfferCanonicalSetup(
+                                for: .unknown, activeCertificateAvailable: activeCertificateAvailable) {
+                                Button("Open JIT-Less Setup") { openJITLessSetup() }
+                            }
+                            Button(checking ? "Checking..." : "Re-check") { Task { await reload() } }
+                                .disabled(checking)
+                        case .activeCertificateMissing, .activeCertificateRevoked,
+                             .activeCertificateExpired:
+                            // Refreshing the copy cannot repair SideStore's own
+                            // certificate, so only Certificates is offered.
+                            Text("Refreshing the JIT-Less copy cannot repair SideStore's active certificate.")
+                                .font(.caption).foregroundColor(.secondary)
+                            Button("Open Certificates") { status.certificatesPresented = true }
+                        case .ready, .notRequired:
+                            EmptyView()
+                        }
+                    }
+                }
             }
         }
         .listStyle(.insetGrouped)
         .navigationTitle("Health Check")
         .task { await reload() }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("V3CanonicalJITLessCertificateUpdated"))) { _ in
+            Task { await reload() }
+        }
     }
+
     private func reload() async {
+        guard !checking else { return }
+        checking = true
+        defer { checking = false }
+        jitlessDetail = "Checking"
         do {
             let reply = try await V3ServiceBridge.shared.request(operation: "healthSnapshot")
             var result: [(String, String)] = []
@@ -2323,8 +6459,73 @@ struct V3HealthView: View {
                 result.append(("SideSign Configured", (sidesign["configured"] as? Bool ?? false) ? "Yes" : "No"))
             }
             rows = result
+            let certificateState = reply["certificateState"] as? [String: Any] ?? [:]
+            activeCertificateAvailable = certificateState["active"] as? Bool == true
+            let readiness = await V3JITLessStatusReader.read(serviceCertificate: certificateState)
+            certRows = certComparison(service: certificateState,
+                hasImportedCopy: readiness.hasImportedCopy, localFacts: readiness.certificateFacts)
+            jitlessReadiness = readiness.readiness
+            jitlessDetail = readiness.detail
+            // V3_SHARED_JITLESS_FACT_V1: Health is an observer of the same fact,
+            // so visiting Health can also complete Home's outstanding item.
+            status.recordJITLessReadiness(readiness.readiness)
             message = ""
-        } catch { message = error.localizedDescription }
+        } catch {
+            message = V3FailureGuidance.message(error)
+            jitlessReadiness = .unknown
+            jitlessDetail = "Could not check JIT-Less status"
+            activeCertificateAvailable = false
+            status.recordJITLessReadiness(.unknown)
+        }
+    }
+
+    private func openJITLessSetup() {
+        sharedModel.selectedTab = .settings
+        sharedModel.deepLink = URL(string: "livecontainer://jitless-setup")
+    }
+
+    private func openJITLessDiagnose() {
+        sharedModel.selectedTab = .settings
+        sharedModel.deepLink = URL(string: "livecontainer://jitless-diagnose")
+    }
+
+    private func certComparison(service: [String: Any], hasImportedCopy: Bool,
+                                localFacts: V3PKCS12CertificateFacts?) -> [(String, String)] {
+        let active = service["active"] as? Bool ?? false
+        let serialSuffix = service["serialSuffix"] as? String ?? ""
+        let team = service["team"] as? String ?? ""
+        let expiry = service["expiry"] as? Date
+        var result: [(String, String)] = [("SideStore Active", active ? "Yes" : "No")]
+        if active {
+            if !serialSuffix.isEmpty { result.append(("Active Serial", "?\(serialSuffix)")) }
+            if !team.isEmpty { result.append(("Active Team", "?\(String(team.suffix(4)))")) }
+            if let expiry { result.append(("Active Expiry", expiry.formatted(date: .abbreviated, time: .omitted))) }
+        }
+        result.append(("JIT-Less Copy", hasImportedCopy ? "Imported" : "Not imported"))
+        let localTeam = localFacts?.teamIdentifier ?? ""
+        let localFingerprint = localFacts?.identitySHA256 ?? ""
+        if !localTeam.isEmpty {
+            result.append(("Copy Team", "?\(String(localTeam.suffix(4)))"))
+        }
+        if let date = LCUtils.appGroupUserDefault.object(forKey: "LCCertificateUpdateDate") as? Date {
+            result.append(("Copy Imported", date.formatted(date: .abbreviated, time: .shortened)))
+        }
+        let teamVerdict: String
+        if !active { teamVerdict = "unknown: no active SideStore certificate" }
+        else if localTeam.isEmpty || team.isEmpty { teamVerdict = "unknown: team could not be compared" }
+        else { teamVerdict = localTeam == team ? "yes: same team" : "no: different teams" }
+        result.append(("Team Match", teamVerdict))
+        let activeFingerprint = service["certificateIdentitySHA256"] as? String ?? ""
+        let identityVerdict: String
+        if !active { identityVerdict = "unknown: no active SideStore certificate" }
+        else if activeFingerprint.isEmpty || localFingerprint.isEmpty {
+            identityVerdict = "unknown: certificate identity could not be compared"
+        } else {
+            identityVerdict = activeFingerprint == localFingerprint ? "yes: same certificate" : "no: different certificates"
+        }
+        result.append(("Certificate Identity Match", identityVerdict))
+        if active { result.append(("SideStore Certificate Validation", service["validation"] as? String ?? "unknown")) }
+        return result
     }
 }
 
@@ -2337,6 +6538,8 @@ struct V3BackupsView: View {
     @State private var shareItems: [Any]?
     @State private var message = ""
     @State private var importedEmail = ""
+    @State private var exportBusy = false
+    @State private var importBusy = false
     var body: some View {
         List {
             if !message.isEmpty {
@@ -2365,11 +6568,12 @@ struct V3BackupsView: View {
                 SecureField("File Password", text: $exportPassword)
                     .textFieldStyle(.roundedBorder)
                 Toggle("Include Apple Password", isOn: $includeApple)
-                Button("Export Account File") { Task { await exportAccount() } }
-                    .disabled(exportPassword.isEmpty)
+                Button(exportBusy ? "Exporting..." : "Export Account File") { Task { await exportAccount() } }
+                    .disabled(exportPassword.isEmpty || exportBusy || importBusy)
             }
             Section("Import Account") {
-                Button("Select Backup File") { pickerPresented = true }
+                Button(importBusy ? "Importing..." : "Select Backup File") { pickerPresented = true }
+                    .disabled(exportBusy || importBusy)
                 SecureField("File Password", text: $importPassword)
                     .textFieldStyle(.roundedBorder)
                 if !importedEmail.isEmpty {
@@ -2393,6 +6597,8 @@ struct V3BackupsView: View {
         }
     }
     private func exportAccount() async {
+        exportBusy = true
+        defer { exportBusy = false }
         do {
             let reply = try await V3ServiceBridge.shared.request(operation: "accountExport",
                 payload: ["password": exportPassword, "includeApple": includeApple])
@@ -2405,9 +6611,11 @@ struct V3BackupsView: View {
             try data.write(to: url, options: .atomic)
             shareItems = [url]
             message = ""
-        } catch { message = error.localizedDescription }
+        } catch { message = V3FailureGuidance.message(error) }
     }
     private func importAccount(_ url: URL) async {
+        importBusy = true
+        defer { importBusy = false }
         do {
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
@@ -2417,13 +6625,15 @@ struct V3BackupsView: View {
                 payload: ["password": importPassword])
             importedEmail = reply["email"] as? String ?? ""
             message = ""
-        } catch { message = error.localizedDescription }
+            status.reload()
+        } catch { message = V3FailureGuidance.message(error) }
     }
 }
 
 struct V3SideJITView: View {
     @StateObject private var store = V3SettingsStore()
     @State private var ping = ""
+    @State private var testing = false
     var body: some View {
         List {
             if !store.message.isEmpty {
@@ -2432,7 +6642,8 @@ struct V3SideJITView: View {
             Section("Server") {
                 V3ToggleRow(store: store, title: "SideJIT Server Enabled", key: "isSideJITServerEnabled")
                 V3TextRow(store: store, title: "Server Address", key: "textInputSideJITServerurl")
-                Button("Test Reachability") { test() }
+                Button(testing ? "Checking..." : "Test Reachability") { test() }
+                    .disabled(testing)
                 if !ping.isEmpty {
                     Text(ping).font(.caption).foregroundColor(.secondary)
                 }
@@ -2443,13 +6654,16 @@ struct V3SideJITView: View {
         .task { await store.load() }
     }
     private func test() {
+        guard !testing else { return }
         guard let address = store.strings["textInputSideJITServerurl"], !address.isEmpty,
               let url = URL(string: address.hasPrefix("http") ? address : "http://" + address) else {
             ping = "Enter a server address first."
             return
         }
+        testing = true
         ping = "Checking..."
         Task {
+            defer { testing = false }
             do {
                 var request = URLRequest(url: url, timeoutInterval: 10)
                 request.httpMethod = "GET"
@@ -2518,14 +6732,25 @@ struct V3DiagnosticsView: View {
 struct V3LogsView: View {
     @State private var tail = ""
     @State private var message = ""
+    @State private var copied = false
+    @State private var reloading = false
     var body: some View {
         List {
             if !message.isEmpty {
                 Section { Text(message).font(.footnote).foregroundColor(.red) }
             }
             Section {
-                Button("Reload Logs") { Task { await reload() } }
-                Button("Copy Logs") { UIPasteboard.general.string = tail }
+                Button(reloading ? "Loading Logs..." : "Reload Logs") { Task { await reload() } }
+                    .disabled(reloading)
+                Button(copied ? "Copied" : "Copy Logs") {
+                    UIPasteboard.general.string = tail
+                    copied = true
+                    Task {
+                        try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        copied = false
+                    }
+                }
+                .disabled(reloading || tail.isEmpty)
             }
             Section("Operation Logs") {
                 Text(String(tail.suffix(120_000)))
@@ -2538,11 +6763,14 @@ struct V3LogsView: View {
         .task { await reload() }
     }
     private func reload() async {
+        guard !reloading else { return }
+        reloading = true
+        defer { reloading = false }
         do {
             let reply = try await V3ServiceBridge.shared.request(operation: "logTail")
             tail = reply["tail"] as? String ?? ""
             message = ""
-        } catch { message = error.localizedDescription }
+        } catch { message = V3FailureGuidance.message(error) }
     }
 }
 
@@ -2584,57 +6812,185 @@ final class V3SetupStore: ObservableObject {
     @Published var device = V3SetupStepState()
     @Published var pairing = V3SetupStepState()
     @Published var account = V3SetupStepState()
+    @Published var jitless = V3SetupStepState()
+    @Published var jitlessHasActiveCertificate = false
     @Published var network = V3SetupStepState()
     @Published var tunnel = V3SetupStepState()
     @Published var background = V3SetupStepState()
     @Published var schedule = V3SetupStepState()
     @Published var verification = V3SetupStepState()
+    // V3_REFRESH_PREREQUISITE_POLICY_V1: the "What you can do" line for a
+    // blocked or failed Test Refresh, kept separate from the row detail so the
+    // structured failure fields stay machine-readable.
+    @Published var verificationGuidance = ""
     @Published var failureOperation = ""
     @Published var failureStage = ""
     @Published var failureCode = ""
     @Published var failureCorrelation = ""
     @Published var failureRetryable = ""
+    @Published var testLedgerState = ""
+    @Published var testSummarySchema = ""
     @Published var testRunning = false
     @Published var lastVerified: Date?
     @Published var diagnostics = ""
     private var testTask: Task<Void, Never>?
-    private var baselineRunID: String?
+    private var testRequestID: String?
+    private var testRunID: String?
+    private var testAttemptID: String?
 
     private var groupDefaults: UserDefaults? {
         UserDefaults(suiteName: "group.com.SideStore.SideStore")
+    }
+    private static let pendingTestRequestIDKey = "V3SetupPendingRefreshRequestID"
+    private static let pendingTestRequestDateKey = "V3SetupPendingRefreshRequestDate"
+    private var testRequestStartedAt: Date?
+
+    private func testRequestDisposition() -> V3SetupTestRequestDisposition {
+        let defaults = groupDefaults
+        let ledger = defaults?.dictionary(forKey: "liveContainerAutoRefreshRunLedger") ?? [:]
+        let pendingID = defaults?.string(forKey: Self.pendingTestRequestIDKey) ?? testRequestID
+        let pendingRecord = pendingID.flatMap {
+            V3RefreshAllAttemptState.record(in: ledger, requestID: $0)
+        }
+        let activeRunID = defaults?.string(forKey: "liveContainerAutoRefreshActiveRunID")
+        let activeRecord = activeRunID.flatMap { ledger[$0] as? [String: Any] }
+        let storedDate = defaults?.object(forKey: Self.pendingTestRequestDateKey) as? Date
+        let startedAt = storedDate ?? testRequestStartedAt
+        let age = startedAt.map { max(0, Date().timeIntervalSince($0)) } ?? .infinity
+        return V3SetupTestRequestPolicy.select(
+            pendingRequestID: pendingID, pendingAge: age,
+            pendingState: pendingRecord?["state"] as? String,
+            activeRunID: activeRunID,
+            activeRunRequestID: activeRecord?["request_id"] as? String)
     }
 
     // Setup Complete requires every required item: pairing, signed-in account
     // with team, acceptable network and tunnel, available Background App
     // Refresh, an enabled schedule, and a test verified in this assistant
     // session. Developer Mode stays advisory and never gates.
-    var isComplete: Bool {
-        pairing.state == "complete" &&
-        account.state == "complete" &&
-        network.state == "complete" &&
-        tunnel.state == "complete" &&
-        background.state == "complete" &&
-        schedule.state == "complete" &&
-        verification.state == "complete"
+    // V3_SETUP_COMPLETION_POLICY_V1: the decision comes from the one shared
+    // policy that Home also uses, so the two screens cannot disagree.
+    /// V3_SHARED_JITLESS_FACT_V1: the store is passed in because the fact the
+    /// decision needs is published on the status store, and this type is not a
+    /// View. Reading the published fact rather than a local copy is what stops
+    /// the assistant and Home from holding two answers.
+    func completionInputs(status: V3SideStoreStatusStore) -> V3SetupCompletionInputs {
+        V3SetupCompletionInputs(
+            accountComplete: account.state == "complete",
+            provisioningIncomplete: statusProvisioningIncomplete,
+            pairingSatisfied: pairing.state == "complete",
+            // V3_SHARED_JITLESS_FACT_V1: both surfaces ask the same shared
+            // policy the same question, of the same published fact. The
+            // assistant previously answered from its own step-state string,
+            // which is a second authority: Health could publish a ready
+            // readiness the assistant had not yet observed, and the two would
+            // disagree about whether the item was outstanding.
+            jitlessRequired: V3JITLessCompletionPolicy.isRequired(
+                osMajor: ProcessInfo.processInfo.operatingSystemVersion.majorVersion),
+            jitlessComplete: V3JITLessCompletionPolicy.isComplete(status.jitlessReadiness),
+            networkComplete: network.state == "complete",
+            tunnelComplete: tunnel.state == "complete",
+            backgroundRefreshAvailable: background.state == "complete",
+            scheduleEnabled: schedule.state == "complete",
+            verifiedRefreshPresent: verification.state == "complete")
     }
+    func outstandingSetup(status: V3SideStoreStatusStore) -> [V3SetupOutstandingItem] {
+        completionInputs(status: status).outstanding()
+    }
+    func isComplete(status: V3SideStoreStatusStore) -> Bool {
+        completionInputs(status: status).isComplete
+    }
+
+    /// Where the JIT-Less row leads when the state still needs work. A ready
+    /// state has no required destination; its diagnostic action is separate.
+    /// The status store is passed in because the store is not a View and has no
+    /// environment of its own.
+    func jitlessDestination(status: V3SideStoreStatusStore) -> AnyView? {
+        let readiness = status.jitlessReadiness ?? .unknown
+        if readiness.isSatisfied { return nil }
+        if [.activeCertificateRevoked, .activeCertificateExpired].contains(readiness) || !jitlessHasActiveCertificate {
+            return AnyView(V3CertificatesView().environmentObject(status))
+        }
+        return nil
+    }
+
+    // Set from the authoritative snapshot so the shared policy sees the same
+    // provisioning fact Home sees, rather than inferring it from step states.
+    @Published private(set) var statusProvisioningIncomplete = false
 
     func recalculate(status: V3SideStoreStatusStore) async {
         NSLog("[V3_SETUP] STATUS recalculating")
+        // Recorded from the authoritative snapshot so the shared completion
+        // policy sees the same provisioning fact Home sees.
+        statusProvisioningIncomplete = status.provisioningIncomplete
         device = V3SetupStepState(state: "complete", detail: "App running")
-        if status.pairing == "Pairing file available" {
+        // V3_REFRESH_PREREQUISITE_POLICY_V1: shared with Home Refresh All, Test
+        // Refresh, and targeted refresh. A known-missing pairing file is
+        // "missing"; an unknown status stays unknown rather than being reported
+        // as missing.
+        switch V3RefreshPrerequisite.evaluate(pairingStatus: status.pairing).state {
+        case .satisfied:
             pairing = V3SetupStepState(state: "complete", detail: "Pairing file available")
-        } else {
-            pairing = V3SetupStepState(state: "actionRequired", detail: "No pairing file yet")
+        case .unsatisfied:
+            pairing = V3SetupStepState(state: "actionRequired", detail: V3RefreshPrerequisite.pairingRequiredDetail)
+        case .unknown:
+            pairing = V3SetupStepState(state: "checking", detail: "Checking pairing file status")
         }
+        // V3_AUTH_SESSION_SNAPSHOT_V1: an authenticated session with incomplete
+        // provisioning is signed in, so the row must not read "Not signed in".
         if status.needsSignIn {
             account = V3SetupStepState(state: "actionRequired", detail: "Not signed in")
+        } else if status.provisioningIncomplete {
+            account = V3SetupStepState(state: "warning", detail: "Signed in, provisioning needs attention")
         } else if status.team == "No active team" {
             account = V3SetupStepState(state: "warning", detail: "Signed in without an active team")
         } else {
             account = V3SetupStepState(state: "complete", detail: status.account)
         }
+        // V3_SHARED_JITLESS_FACT_V1: the requirement itself also comes from the
+        // shared policy, so the branch below and the completion input can never
+        // disagree about whether JIT-Less applies on this iOS version.
+        if !V3JITLessCompletionPolicy.isRequired(
+            osMajor: ProcessInfo.processInfo.operatingSystemVersion.majorVersion) {
+            status.recordJITLessReadiness(.notRequired)
+            jitless = V3SetupStepState(state: "complete", detail: "Not required on this iOS version")
+        } else {
+            do {
+                let health = try await V3ServiceBridge.shared.request(operation: "healthSnapshot")
+                let certificate = health["certificateState"] as? [String: Any] ?? [:]
+                jitlessHasActiveCertificate = certificate["active"] as? Bool == true
+                let readiness = await V3JITLessStatusReader.read(serviceCertificate: certificate)
+                // V3_SHARED_JITLESS_FACT_V1: the published fact is the only
+                // authority. Nothing keeps a local copy, so no surface can hold
+                // a second answer to the same question.
+                status.recordJITLessReadiness(readiness.readiness)
+                // V3_JITLESS_PRESENTATION_V1: the step state is derived from the
+                // shared presentation, so a ready state is stored as complete
+                // rather than as a permanent "action required" row.
+                let presentation = V3JITLessPresentation.present(readiness.readiness)
+                switch presentation.severity {
+                case .completed:
+                    jitless = V3SetupStepState(state: "complete", detail: presentation.title)
+                case .failed:
+                    jitless = V3SetupStepState(state: "failed", detail: presentation.title)
+                case .unknown:
+                    jitless = V3SetupStepState(state: "warning", detail: presentation.title)
+                default:
+                    jitless = V3SetupStepState(state: "actionRequired", detail: presentation.title)
+                }
+            } catch {
+                jitlessHasActiveCertificate = false
+                // Not observed is published as unknown, so Home keeps the item
+                // outstanding instead of assuming a certificate exists.
+                status.recordJITLessReadiness(.unknown)
+                jitless = V3SetupStepState(state: "warning", detail: "Could not verify JIT-Less certificate state")
+            }
+        }
         network = V3SetupStepState(state: "checking", detail: "Checking Wi-Fi…")
         let wifi = await LiveContainerNetworkPreflight.wifiAvailable()
+        // Published so the shared setup-completion policy and the Home banner
+        // observe the same authoritative Wi-Fi fact instead of each deciding.
+        status.recordWifiAvailability(wifi)
         if !wifi {
             network = V3SetupStepState(state: "failed", detail: "Wi-Fi unavailable")
             tunnel = V3SetupStepState(state: "unavailable", detail: "Needs Wi-Fi first")
@@ -2702,77 +7058,258 @@ final class V3SetupStore: ObservableObject {
         NSLog("[V3_SETUP] FAILURE operation=%@ stage=%@ code=%@ correlation=%@", operation, stage, code, correlation)
     }
 
+    /// Records a Test Refresh failure for the Setup Assistant.
+    ///
+    /// V3_FAILURE_GUIDANCE_V1: the row caption is product copy, so it shows
+    /// guidance. It previously appended the numeric NSError domain and code,
+    /// which is the practice the failure policy exists to remove, and the branch
+    /// that did it also made the final `else` unreachable: every Swift Error
+    /// bridges to `NSError?`, so that arm could never run. The domain and code
+    /// remain available in the diagnostics block, which is where a support reader
+    /// looks for them.
     func recordError(_ error: Error, operation: String) {
         if let failure = error as? CombinedFailure {
-            let technical = failure.technicalDetails
             recordFailure(operation: operation, stage: failure.stage.rawValue, code: failure.code.rawValue,
                           correlation: failure.correlationID,
                           retryable: failure.retryable.map { $0 ? "true" : "false" } ?? "")
-            verification = V3SetupStepState(state: "failed", detail: technical)
-        } else if let native = error as NSError? {
-            // No stage/code is invented for generic errors, but the available
-            // domain and code travel with the message instead of being dropped.
-            recordFailure(operation: operation, stage: "", code: "",
-                          correlation: "", retryable: "")
-            verification = V3SetupStepState(state: "failed",
-                detail: error.localizedDescription + " (\(native.domain) \(native.code))")
-        } else {
-            verification = V3SetupStepState(state: "failed", detail: error.localizedDescription)
+            verification = V3SetupStepState(state: "failed", detail: failure.safeMessage)
+            verificationGuidance = failure.recovery
+            return
         }
+        // No stage or code is invented for an untyped error. Nothing claimed a
+        // cause, so nothing is asserted about one.
+        recordFailure(operation: operation, stage: "", code: "", correlation: "", retryable: "")
+        verification = V3SetupStepState(state: "warning",
+            detail: "Test refresh could not be completed, and the cause is not known.")
+        verificationGuidance = V3FailureGuidance.message(error)
     }
 
-    func runTestRefresh() {
+    // V3_REFRESH_PREREQUISITE_POLICY_V1: Test Refresh uses the same
+    // authoritative prerequisite contract as Home Refresh All. A known-missing
+    // pairing file must never post the scheduler notification, so no backend
+    // mutation is started, and it must never be reported as an unexplained
+    // refresh failure.
+    func runTestRefresh(status: V3SideStoreStatusStore) {
         guard !testRunning else { return }
+        let disposition = testRequestDisposition()
+        let requestID: String
+        let shouldPostRequest: Bool
+        switch disposition {
+        case .waitForActiveRun:
+            let defaults = groupDefaults
+            // We cannot safely attach an uncorrelated pending request to this
+            // different active run. It did not create a second scheduler run.
+            defaults?.removeObject(forKey: Self.pendingTestRequestIDKey)
+            defaults?.removeObject(forKey: Self.pendingTestRequestDateKey)
+            testRequestStartedAt = nil
+            testRequestID = nil
+            testRunID = nil
+            testAttemptID = nil
+            testRunning = false
+            failureOperation = ""
+            failureStage = ""
+            failureCode = ""
+            failureCorrelation = ""
+            failureRetryable = ""
+            verification = V3SetupStepState(state: "warning",
+                detail: "Another refresh is already running. Test Refresh did not start.")
+            verificationGuidance = "Wait for the current refresh to finish, then start Test Refresh again."
+            NSLog("[V3_SETUP] TEST_REFRESH_BLOCKED reason=activeRun")
+            return
+        case .resumeExisting(let existingRequestID):
+            requestID = existingRequestID
+            shouldPostRequest = false
+            testRequestID = existingRequestID
+            testRequestStartedAt = groupDefaults?.object(
+                forKey: Self.pendingTestRequestDateKey) as? Date ?? Date()
+            let ledger = groupDefaults?.dictionary(forKey: "liveContainerAutoRefreshRunLedger") ?? [:]
+            testRunID = V3RefreshAllAttemptState.record(in: ledger,
+                requestID: existingRequestID)?["run_id"] as? String
+        case .startNew:
+            requestID = UUID().uuidString
+            shouldPostRequest = true
+            if let failure = V3RefreshPrerequisite.evaluate(pairingStatus: status.pairing)
+                .failure(correlationID: requestID) {
+                testRunning = false
+                testRequestID = nil
+                testRunID = nil
+                testAttemptID = nil
+                testTask = nil
+                testRequestStartedAt = nil
+                recordFailure(operation: failure.operation, stage: failure.stage.rawValue,
+                              code: failure.code.rawValue, correlation: failure.correlationID,
+                              retryable: "false")
+                verification = V3SetupStepState(state: "actionRequired", detail: failure.safeMessage)
+                verificationGuidance = "Place or import a valid pairing file, then try again."
+                NSLog("[V3_SETUP] TEST_REFRESH_BLOCKED reason=pairing request_id=%@", requestID)
+                return
+            }
+            let startedAt = Date()
+            testRequestStartedAt = startedAt
+            groupDefaults?.set(requestID, forKey: Self.pendingTestRequestIDKey)
+            groupDefaults?.set(startedAt, forKey: Self.pendingTestRequestDateKey)
+            testRequestID = requestID
+            testRunID = nil
+        }
         testRunning = true
-        baselineRunID = verificationManifest()?["run_id"] as? String
-        verification = V3SetupStepState(state: "running", detail: "Test refresh running…")
-        NSLog("[V3_SETUP] TEST_REFRESH_START")
-        NotificationCenter.default.post(name: Notification.Name("LiveContainerAutoRefreshRunNow"), object: nil)
+        let attemptID = UUID().uuidString
+        testAttemptID = attemptID
+        testLedgerState = ""
+        testSummarySchema = ""
+        failureOperation = ""
+        failureStage = ""
+        failureCode = ""
+        failureCorrelation = ""
+        failureRetryable = ""
+        verification = V3SetupStepState(state: "running",
+            detail: shouldPostRequest ? "Test refresh running…" : "Resuming the current Test Refresh…")
+        verificationGuidance = ""
+        NSLog("[V3_SETUP] TEST_REFRESH_START request_id=%@ origin=setupAssistant resumed=%@",
+              requestID, shouldPostRequest ? "false" : "true")
+        if shouldPostRequest {
+            NotificationCenter.default.post(name: Notification.Name("LiveContainerAutoRefreshRunNow"), object: nil,
+                                            userInfo: ["requestID": requestID, "origin": "setupAssistant"])
+        }
+        startTestMonitor(requestID: requestID, attemptID: attemptID)
+    }
+
+    private func startTestMonitor(requestID: String, attemptID: String) {
         testTask = Task {
             do {
                 let deadline = Date().addingTimeInterval(600)
                 while !Task.isCancelled && Date() < deadline {
                     try await Task.sleep(nanoseconds: 2_000_000_000)
                     try Task.checkCancellation()
-                    if await checkTestResult() { return }
+                    if await checkTestResult(attemptID: attemptID) { return }
                 }
-                if !Task.isCancelled {
+                if V3SetupTestAttemptPolicy.mayApply(capturedAttemptID: attemptID,
+                    currentAttemptID: testAttemptID, taskCancelled: Task.isCancelled) {
                     verification = V3SetupStepState(state: "warning", detail: "No verified result yet. Check Refresh Manager for progress.")
                     NSLog("[V3_SETUP] TEST_REFRESH_TERMINAL result=timeout")
+                    testRunning = false
+                    testAttemptID = nil
+                    testTask = nil
                 }
+            } catch is CancellationError {
+                return
             } catch {
+                guard V3SetupTestAttemptPolicy.mayApply(capturedAttemptID: attemptID,
+                    currentAttemptID: testAttemptID, taskCancelled: Task.isCancelled) else { return }
                 recordError(error, operation: "refresh")
                 NSLog("[V3_SETUP] TEST_REFRESH_TERMINAL result=error")
+                testRunning = false
+                testAttemptID = nil
+                testTask = nil
             }
-            testRunning = false
         }
     }
 
-    private func checkTestResult() async -> Bool {
-        // The current setup test requires a NEW run ID plus the authoritative
-        // complete-result contract: every expected app present exactly once.
-        // A partial manifest (for example two expected apps but one result)
-        // never verifies, no matter how old or new it is.
-        guard let manifest = verificationManifest(),
-              let runID = manifest["run_id"] as? String,
-              runID != baselineRunID,
-              CombinedVerification.hasCompleteTerminalResults(manifest, runID: runID) else {
+    private func checkTestResult(attemptID: String) async -> Bool {
+        guard V3SetupTestAttemptPolicy.mayApply(capturedAttemptID: attemptID,
+            currentAttemptID: testAttemptID, taskCancelled: Task.isCancelled) else { return false }
+        guard let requestID = testRequestID else { return false }
+        let ledger = groupDefaults?.dictionary(forKey: "liveContainerAutoRefreshRunLedger") ?? [:]
+        guard let runRecord = V3RefreshAllAttemptState.record(in: ledger, requestID: requestID),
+              let runID = runRecord["run_id"] as? String else {
+            let age = testRequestStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+            let activeRunID = groupDefaults?.string(forKey: "liveContainerAutoRefreshActiveRunID") ?? ""
+            let activeRecord = ledger[activeRunID] as? [String: Any]
+            let activeRequestID = activeRecord?["request_id"] as? String
+            if age >= V3SetupTestRequestPolicy.startGracePeriod,
+               activeRunID.isEmpty || activeRequestID != requestID {
+                recordFailure(operation: "refresh", stage: CombinedFailure.Stage.command.rawValue,
+                    code: CombinedFailure.Code.busy.rawValue, correlation: requestID, retryable: "false")
+                verification = V3SetupStepState(state: "failed", detail: "Refresh did not start.")
+                verificationGuidance = activeRunID.isEmpty
+                    ? "Check Refresh Manager, then try Test Refresh again."
+                    : "Another refresh took the scheduler first. Wait for it to finish, then start Test Refresh again."
+                finishTestAttempt(requestID: requestID, attemptID: attemptID)
+                NSLog("[V3_SETUP] TEST_REFRESH_TERMINAL result=not_started request_id=%@", requestID)
+                return true
+            }
             return false
         }
-        let results = manifest["results"] as? [[String: Any]] ?? []
-        if results.allSatisfy({ $0["success"] as? Bool == true }) {
+        if let testRunID, testRunID != runID { return false }
+        testRunID = runID
+        let runState = runRecord["state"] as? String ?? ""
+        testLedgerState = runState
+        guard runState == "completed" || runState == "failed" else { return false }
+        let manifest = runRecord["manifest"] as? [String: Any]
+        let verifiedManifest = manifest.map {
+            $0["run_id"] as? String == runID &&
+                CombinedVerification.hasCompleteTerminalResults($0, runID: runID)
+        } ?? false
+        let verifiedSummary = V3RefreshAllTerminalEvidencePolicy.verifiedSummary(
+            runRecord["manifest_summary"] as? [String: Any], record: runRecord, runID: runID)
+        let summary = runRecord["manifest_summary"] as? [String: Any]
+        testSummarySchema = summary?["schema"] as? String ?? "missing"
+        switch V3SetupRefreshTerminalEvidencePolicy.outcome(state: runState,
+            hasVerifiedManifest: verifiedManifest, hasVerifiedSummary: verifiedSummary) {
+        case .pending:
+            return false
+        case .failed:
+            let wire = runRecord["failure"] as? [String: Any]
+            if let failure = wire.flatMap({ CombinedFailure.decode($0, expectedID: runID) }),
+               failure.operation == "refresh" {
+                recordFailure(operation: failure.operation, stage: failure.stage.rawValue,
+                    code: failure.code.rawValue, correlation: failure.correlationID,
+                    retryable: failure.retryable.map { $0 ? "true" : "false" } ?? "")
+                verification = V3SetupStepState(state: "failed",
+                    detail: runRecord["message"] as? String ?? failure.safeMessage)
+                verificationGuidance = failure.recovery
+            } else {
+                recordFailure(operation: "refresh", stage: CombinedFailure.Stage.refreshVerification.rawValue,
+                    code: "unknown", correlation: runID, retryable: "unknown")
+                verification = V3SetupStepState(state: "failed",
+                    detail: runRecord["message"] as? String ?? "Refresh failed, but no safe underlying cause was available.")
+                verificationGuidance = "Open Refresh Manager to inspect this run, then try Test Refresh again. Copy Diagnostics if the result remains unclear."
+            }
+            finishTestAttempt(requestID: requestID, attemptID: attemptID)
+            NSLog("[V3_SETUP] TEST_REFRESH_TERMINAL result=failed run_id=%@", runID)
+            return true
+        case .completedUnverified:
+            recordFailure(operation: "refresh", stage: CombinedFailure.Stage.refreshVerification.rawValue,
+                code: "invalidResponse", correlation: runID, retryable: "false")
+            verification = V3SetupStepState(state: "failed",
+                detail: "SideStore reported that refresh completed, but this run's result could not be verified.")
+            verificationGuidance = "Open Refresh Manager to reconcile the run, then run Test Refresh again. Copy Diagnostics if the result remains missing."
+            finishTestAttempt(requestID: requestID, attemptID: attemptID)
+            NSLog("[V3_SETUP] TEST_REFRESH_TERMINAL result=unverified_completion run_id=%@", runID)
+            return true
+        case .verified:
+            break
+        }
+        let results = manifest?["results"] as? [[String: Any]] ?? []
+        if runState == "completed" && (verifiedSummary || results.allSatisfy({ $0["success"] as? Bool == true })) {
             verification = V3SetupStepState(state: "complete", detail: "Refresh verified")
-            if let date = manifest["date"] as? Date {
+            if let date = manifest?["date"] as? Date {
                 lastVerified = date
+            } else if let verifiedAt = (runRecord["manifest_summary"] as? [String: Any])?["verified_at"] as? Date {
+                lastVerified = verifiedAt
+            } else if let terminalAt = runRecord["terminal_at"] as? TimeInterval {
+                lastVerified = Date(timeIntervalSince1970: terminalAt)
             }
         } else {
             var detail = "Refresh reported failures"
             if let failed = results.first(where: { $0["success"] as? Bool != true }) {
                 recordFailure(operation: "refresh", stage: "", code: "", correlation: runID, retryable: "")
-                if let message = failed["error"] as? String, !message.isEmpty {
-                    detail = message
+                // V3_FAILURE_GUIDANCE_V1: the manifest's "error" field is a
+                // diagnostic block of message, recovery and technical details
+                // joined by newlines. It was used verbatim as the row caption, so
+                // a diagnostics line was rendered as product copy. The caption
+                // takes the structured failure's safe message when the manifest
+                // carries one, and the full text is still available below in the
+                // diagnostics block.
+                let wire = failed["failure"] as? [String: Any]
+                let decoded = wire.flatMap { CombinedFailure.decode($0, expectedID: runID) }
+                if let decoded {
+                    detail = decoded.safeMessage
+                    verificationGuidance = decoded.recovery
+                } else if let message = failed["error"] as? String, !message.isEmpty,
+                          let firstLine = message.split(separator: "\n").first {
+                    detail = String(firstLine)
                 }
-                if let failure = failed["failure"] as? [String: Any] {
+                if let failure = wire {
                     recordFailure(operation: failure["operation"] as? String ?? "refresh",
                                   stage: failure["stage"] as? String ?? "",
                                   code: failure["code"] as? String ?? "",
@@ -2782,7 +7319,7 @@ final class V3SetupStore: ObservableObject {
             }
             verification = V3SetupStepState(state: "failed", detail: detail)
         }
-        testRunning = false
+        finishTestAttempt(requestID: requestID, attemptID: attemptID)
         if verification.state == "complete" {
             NSLog("[V3_SETUP] TEST_REFRESH_TERMINAL result=verified")
         } else {
@@ -2791,17 +7328,50 @@ final class V3SetupStore: ObservableObject {
         return true
     }
 
+    private func finishTestAttempt(requestID: String, attemptID: String) {
+        guard V3SetupTestAttemptPolicy.mayApply(capturedAttemptID: attemptID,
+            currentAttemptID: testAttemptID, taskCancelled: Task.isCancelled) else { return }
+        testRunning = false
+        testAttemptID = nil
+        testTask = nil
+        testRequestID = nil
+        testRunID = nil
+        testRequestStartedAt = nil
+        if groupDefaults?.string(forKey: Self.pendingTestRequestIDKey) == requestID {
+            groupDefaults?.removeObject(forKey: Self.pendingTestRequestIDKey)
+            groupDefaults?.removeObject(forKey: Self.pendingTestRequestDateKey)
+        }
+    }
+
     func cancelTest() {
+        guard testRunning else { return }
+        let requestID = testRequestID
+        testAttemptID = nil
         testTask?.cancel()
         testTask = nil
         testRunning = false
+        verification = V3SetupStepState(state: "warning",
+            detail: "Stopped waiting. The current refresh continues in the background.")
+        verificationGuidance = requestID == nil
+            ? "Check Refresh Manager before starting another Test Refresh."
+            : "Tap Test Refresh again to resume this same request; it will not start a duplicate refresh."
+    }
+
+    // A human-copyable pairing word for the diagnostics block. The internal
+    // policy states are not the vocabulary a person reading a support log wants.
+    static func describePairing(_ state: V3RefreshPrerequisiteState) -> String {
+        switch state {
+        case .satisfied: return "available"
+        case .unsatisfied: return "missing"
+        case .unknown: return "unknown"
+        }
     }
 
     func buildDiagnostics(status: V3SideStoreStatusStore) {
         var lines: [String] = ["Setup Assistant"]
         lines.append("Product: " + (Bundle.main.object(forInfoDictionaryKey: "LCProductLine") as? String ?? "unknown"))
         lines.append("iOS: " + UIDevice.current.systemVersion)
-        lines.append("Pairing: " + (status.pairing == "Pairing file available" ? "available" : "missing"))
+        lines.append("Pairing: " + V3SetupStore.describePairing(V3RefreshPrerequisite.evaluate(pairingStatus: status.pairing).state))
         lines.append("Account: " + (status.needsSignIn ? "signed out" : "signed in"))
         lines.append("Team: " + status.team)
         lines.append("Wi-Fi: " + (network.state == "failed" ? "unavailable" : "available"))
@@ -2822,16 +7392,26 @@ final class V3SetupStore: ObservableObject {
         if !failureOperation.isEmpty {
             lines.append("Last structured failure: operation=\(failureOperation) stage=\(failureStage) code=\(failureCode) correlation=\(failureCorrelation) retryable=\(failureRetryable)")
         }
+        if !testLedgerState.isEmpty {
+            lines.append("Test refresh terminal state: \(testLedgerState)")
+            lines.append("Verification summary schema: \(testSummarySchema.isEmpty ? "none" : testSummarySchema)")
+        }
         diagnostics = lines.joined(separator: "\n")
     }
 }
 
 struct V3SetupAssistantView: View {
     @EnvironmentObject private var status: V3SideStoreStatusStore
+    @EnvironmentObject private var sharedModel: SharedModel
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.dismiss) private var dismiss
     @StateObject private var setup = V3SetupStore()
     @State private var vpnWorking = false
+    @State private var copiedDiagnostics = false
+    // V3_RECHECK_PAIRING_ON_RETURN_V1: the pairing file is placed by an
+    // external installation tool, so returning to a live Quick Setup is the
+    // moment a newly placed file can be detected.
+    @State private var showPairingSetup = false
     var body: some View {
         List {
             Section("Device") {
@@ -2841,15 +7421,83 @@ struct V3SetupAssistantView: View {
                          state: V3SetupStepState(state: "warning", detail: "Guidance only: keep Developer Mode on in iOS Settings. Setup continues regardless."),
                          destination: nil)
             }
+            // V3_PAIRING_PLACEMENT_FIRST_V1: the pairing mechanism works. The
+            // documented normal path is placing the file with the installation
+            // tool, so that is what the row explains first. Manual import stays
+            // available as the secondary path.
             Section("Pairing") {
                 setupRow(icon: "link", title: "Pairing File",
                          state: setup.pairing,
                          destination: AnyView(V3PairingView().environmentObject(status)))
+                if setup.pairing.state == "actionRequired" {
+                    Button {
+                        showPairingSetup = true
+                    } label: {
+                        Label("Show Pairing Setup", systemImage: "link.badge.plus")
+                    }
+                    Button {
+                        Task {
+                            // The pairing file is placed by an external installation tool, so
+                            // the authoritative snapshot is the only way to observe it.
+                            // It is awaited before the setup steps are recomputed.
+                            await status.reloadAndWait()
+                            await setup.recalculate(status: status)
+                        }
+                    } label: {
+                        Label("Re-check Pairing", systemImage: "arrow.clockwise")
+                    }
+                }
+            }
+            .sheet(isPresented: $showPairingSetup) {
+                // NavigationView, not NavigationStack: the host target deploys
+                // to iOS 15.
+                NavigationView { V3PairingView().environmentObject(status) }
+                    .navigationViewStyle(StackNavigationViewStyle())
             }
             Section("Apple Account") {
                 setupRow(icon: "person.crop.circle", title: "Apple ID",
                          state: setup.account,
                          destination: AnyView(V3SignInView().environmentObject(status)))
+            }
+            if V3JITLessCompletionPolicy.isRequired(osMajor: ProcessInfo.processInfo.operatingSystemVersion.majorVersion) {
+                // V3_JITLESS_PRESENTATION_V1: a ready JIT-Less state is rendered
+                // as a completed result, not as an outstanding setup task. The
+                // section only presents required actions while something is
+                // actually outstanding.
+                let jitless = V3JITLessPresentation.present(status.jitlessReadiness ?? .unknown)
+                Section("JIT-Less Mode") {
+                    setupRow(icon: jitless.icon, title: "JIT-Less",
+                             state: V3SetupStepState(
+                                state: jitless.isOutstandingSetupTask ? setup.jitless.state : "complete",
+                                detail: jitless.title),
+                             destination: jitless.isOutstandingSetupTask
+                                ? setup.jitlessDestination(status: status)
+                                : nil)
+                    if !jitless.isOutstandingSetupTask {
+                        // Optional diagnostic only. It must not look like setup.
+                        Button {
+                            sharedModel.selectedTab = .settings
+                            sharedModel.deepLink = URL(string: "livecontainer://jitless-diagnose")
+                        } label: {
+                            Label("Open JIT-Less Diagnose", systemImage: "stethoscope")
+                        }
+                        .font(.caption)
+                    } else {
+                        switch V3JITLessSetupActionPolicy.action(
+                            for: status.jitlessReadiness ?? .unknown) {
+                        case .setUp:
+                            Button("Set Up JIT-Less") { openCanonicalJITLessSetup() }
+                        case .refreshCertificate:
+                            Button("Refresh JIT-Less Certificate") { openCanonicalJITLessSetup() }
+                        case .openCertificates:
+                            Button("Open Certificates") { status.certificatesPresented = true }
+                        case .openSetup:
+                            Button("Open JIT-Less Setup") { openCanonicalJITLessSetup() }
+                        case .none:
+                            EmptyView()
+                        }
+                    }
+                }
             }
             Section("Network") {
                 setupRow(icon: "wifi", title: "Wi-Fi",
@@ -2883,7 +7531,7 @@ struct V3SetupAssistantView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
                 Button {
-                    Task { await LiveContainerAutoRefreshScheduler.requestNotificationPermission() }
+                    Task { await LiveContainerAutoRefreshScheduler.requestNotificationPermissionFromUserAction() }
                 } label: {
                     Label("Allow Refresh Notifications", systemImage: "bell.fill")
                 }
@@ -2896,7 +7544,18 @@ struct V3SetupAssistantView: View {
             Section("Verification") {
                 setupRow(icon: "checkmark.seal", title: "Test Refresh",
                          state: setup.verification, destination: nil)
-                if setup.verification.state == "failed" && !setup.failureOperation.isEmpty {
+                if !setup.verificationGuidance.isEmpty {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("What you can do").font(.caption.weight(.semibold))
+                        Text(setup.verificationGuidance).font(.footnote)
+                    }
+                }
+                // V3_REFRESH_PREREQUISITE_POLICY_V1: a structured prerequisite
+                // failure is shown for failed and action-required states alike,
+                // so a known-missing pairing file is never reported as
+                // "no safe underlying cause was available".
+                if (setup.verification.state == "failed" || setup.verification.state == "actionRequired")
+                    && !setup.failureOperation.isEmpty {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("operation=\(setup.failureOperation) stage=\(setup.failureStage) code=\(setup.failureCode)")
                             .font(.caption2).foregroundColor(.secondary).textSelection(.enabled)
@@ -2904,11 +7563,33 @@ struct V3SetupAssistantView: View {
                             .font(.caption2).foregroundColor(.secondary).textSelection(.enabled)
                     }
                 }
+                if setup.verification.state == "actionRequired" && setup.failureStage == CombinedFailure.Stage.pairing.rawValue {
+                    Button {
+                        showPairingSetup = true
+                    } label: {
+                        Label("Show Pairing Setup", systemImage: "link.badge.plus")
+                    }
+                    Button {
+                        Task {
+                            // The pairing file is placed by an external installation tool, so
+                            // the authoritative snapshot is the only way to observe it.
+                            // It is awaited before the setup steps are recomputed.
+                            await status.reloadAndWait()
+                            await setup.recalculate(status: status)
+                        }
+                    } label: {
+                        Label("Re-check Pairing", systemImage: "arrow.clockwise")
+                    }
+                }
                 if setup.testRunning {
-                    Button("Cancel Test", role: .cancel) { setup.cancelTest() }
+                    Button("Stop Waiting", role: .cancel) { setup.cancelTest() }
+                } else if setup.verification.state != "complete" && setup.pairing.state == "actionRequired" {
+                    Text("Complete Pairing Setup before testing refresh.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
                 } else if setup.verification.state != "complete" {
                     Button {
-                        setup.runTestRefresh()
+                        setup.runTestRefresh(status: status)
                     } label: {
                         Label("Run Test Refresh", systemImage: "arrow.clockwise")
                     }
@@ -2919,7 +7600,19 @@ struct V3SetupAssistantView: View {
                         .foregroundColor(.secondary)
                 }
             }
-            if setup.isComplete {
+            // V3_SETUP_COMPLETION_POLICY_V1: when setup is not complete, name
+            // the outstanding items from the one shared policy, so the assistant
+            // and the Home banner can never disagree about what is left.
+            if !setup.outstandingSetup(status: status).isEmpty {
+                Section("Still Needed") {
+                    ForEach(setup.outstandingSetup(status: status), id: \.self) { item in
+                        Label(item.title, systemImage: V3StatusSeverity.warning.icon)
+                            .font(.footnote)
+                            .foregroundColor(.orange)
+                    }
+                }
+            }
+            if setup.isComplete(status: status) {
                 Section("Setup Complete") {
                     Label("Ready to use", systemImage: "checkmark.circle.fill")
                         .foregroundColor(.green)
@@ -2930,19 +7623,48 @@ struct V3SetupAssistantView: View {
                 }
             }
             Section("Diagnostics") {
-                Button("Copy Setup Diagnostics") {
+                Button(copiedDiagnostics ? "Copied" : "Copy Setup Diagnostics") {
                     setup.buildDiagnostics(status: status)
                     UIPasteboard.general.string = setup.diagnostics
+                    copiedDiagnostics = true
+                    Task {
+                        try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        copiedDiagnostics = false
+                    }
                 }
             }
         }
         .listStyle(.insetGrouped)
         .navigationTitle("Setup Assistant")
-        .task { await setup.recalculate(status: status) }
+        .task {
+            // V3_AWAITABLE_RELOAD_V1: the first view of the assistant must be
+            // built from an authoritative snapshot, not from whatever was left
+            // over from a previous session.
+            await status.reloadAndWait()
+            await setup.recalculate(status: status)
+        }
         .onChange(of: scenePhase) { phase in
             if phase == .active {
-                Task { await setup.recalculate(status: status) }
+                Task {
+                    // A pairing file placed by the installation tool while the app
+                    // was backgrounded is detected here. The reload must complete
+                    // before recalculate reads status, otherwise the setup rows
+                    // are computed from the previous snapshot.
+                    await status.reloadAndWait()
+                    await setup.recalculate(status: status)
+                }
             }
+        }
+        .onChange(of: showPairingSetup) { presented in
+            if !presented {
+                Task {
+                    await status.reloadAndWait()
+                    await setup.recalculate(status: status)
+                }
+            }
+        }
+        .onDisappear {
+            if setup.testRunning { setup.cancelTest() }
         }
     }
     private func coredeviceState() -> V3SetupStepState {
@@ -2955,7 +7677,13 @@ struct V3SetupAssistantView: View {
     private func setupRow(icon: String, title: String, state: V3SetupStepState, destination: AnyView?) -> some View {
         if let destination {
             NavigationLink(destination: destination.onDisappear {
-                Task { await setup.recalculate(status: status) }
+                // V3_AWAITABLE_RELOAD_V1: returning from a setup destination may
+                // follow an action that changed authoritative state, so the
+                // snapshot is awaited before the steps are recomputed.
+                Task {
+                    await status.reloadAndWait()
+                    await setup.recalculate(status: status)
+                }
             }) {
                 rowContent(icon: icon, title: title, state: state, linked: true)
             }
@@ -3030,6 +7758,117 @@ struct V3SetupAssistantView: View {
             UIApplication.shared.open(url)
         }
     }
+
+    private func openCanonicalJITLessSetup() {
+        status.pendingCanonicalJITLessSetup = true
+        status.returnToSetupAfterJITLess = true
+        status.setupPresented = false
+    }
+}
+
+// V3_STATUS_TINT_V1
+// The semantic colour for a status. Declared here rather than beside the model
+// because the behavioral primitives are also compiled into the SideStoreSupport
+// target, which does not import SwiftUI. The model stays presentation-free and
+// testable; only this mapping knows about Color.
+extension V3StatusPresentation {
+    var tint: Color {
+        switch severity {
+        case .working: return .blue
+        case .completed: return .green
+        case .warning: return .orange
+        case .failed: return .red
+        case .cancelled: return .orange
+        case .unknown: return .secondary
+        }
+    }
+}
+
+// The JIT-Less presentation carries a severity of its own, so it reuses the
+// same mapping rather than inventing a second colour vocabulary.
+extension V3JITLessPresentation {
+    var status: V3StatusPresentation {
+        V3StatusPresentation(severity: severity, title: title, detail: detail)
+    }
+
+    var tint: Color { status.tint }
+}
+
+struct V3HomeServiceHeader: View {
+    let isConnected: Bool
+    let isLoading: Bool
+    let updatedAt: Date?
+    var onReload: () -> Void = {}
+
+    // V3_RELOAD_STATUS_VISIBILITY_V1
+    // isConnected used to win over isLoading, so a reload in progress still
+    // rendered a green "Active & Connected" and the only difference was a
+    // disabled button, which read as "nothing happened". Loading now has
+    // priority, and a successful manual reload is confirmed in place rather
+    // than by an intrusive repeated alert.
+    private var statusPresentation: V3StatusPresentation {
+        V3StatusPresentation.connectionState(connected: isConnected, loading: isLoading)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                Image(systemName: "shippingbox.circle.fill")
+                    .font(.system(size: 38))
+                    .foregroundColor(.accentColor)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("LiveContainer + SideStore")
+                        .font(.headline)
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            if isLoading {
+                                ProgressView()
+                                    .controlSize(.mini)
+                            } else {
+                                Circle()
+                                    .fill(statusPresentation.tint)
+                                    .frame(width: 8, height: 8)
+                            }
+                            // Icon and text both carry the state, so the meaning
+                            // does not depend on colour alone.
+                            Label(statusPresentation.title, systemImage: statusPresentation.icon)
+                                .font(.caption)
+                                .foregroundColor(statusPresentation.tint)
+                        }
+                        if let updatedAt {
+                            Text("Updated " + updatedAt.formatted(date: .omitted, time: .standard))
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                                .accessibilityLabel("Status last updated " + updatedAt.formatted(date: .abbreviated, time: .shortened))
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Button(action: onReload) {
+                Label {
+                    Text(isLoading ? "Reloading Status..." : "Reload Status")
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                        .fixedSize(horizontal: false, vertical: true)
+                } icon: {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                }
+                .font(.caption.weight(.semibold))
+                .frame(maxWidth: .infinity, alignment: .center)
+            }
+            .buttonStyle(.bordered)
+            .buttonBorderShape(.capsule)
+            .frame(maxWidth: .infinity)
+            .disabled(isLoading)
+            .accessibilityHint("Reloads the latest SideStore connection and account status. This does not refresh installed apps.")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("SideStore status: " + statusPresentation.title
+                            + ", " + statusPresentation.severityName)
+    }
 }
 
 private struct V3HomeView: View {
@@ -3040,45 +7879,42 @@ private struct V3HomeView: View {
     // The banner is a nudge, not acceptance: it hides only when account,
     // pairing, schedule, Background App Refresh and at least one verified
     // refresh are all in place. Acceptance itself stays in V3SetupStore.
-    private var setupIncomplete: Bool {
-        if status.needsSignIn || status.pairing == "Pairing file required" { return true }
-        if let defaults, !defaults.bool(forKey: "liveContainerAutoRefreshEnabled") { return true }
-        if UIApplication.shared.backgroundRefreshStatus != .available { return true }
-        let verifiedID = defaults?.dictionary(forKey: "liveContainerAutoRefreshVerification")?["run_id"] as? String
-        if verifiedID?.isEmpty != false { return true }
-        return false
+    // V3_SETUP_COMPLETION_POLICY_V1: Home consumes the same policy as the Setup
+    // Assistant. The banner used to omit JIT-Less, network, and tunnel, so it
+    // could disappear while the assistant still considered setup incomplete.
+    private var setupIncomplete: Bool { !V3HomeView.completionInputs(status: status, defaults: defaults).isComplete }
+
+    /// Derived from the same authoritative facts the Setup Assistant uses.
+    static func completionInputs(status: V3SideStoreStatusStore,
+                                 defaults: UserDefaults?) -> V3SetupCompletionInputs {
+        let verifiedRunID = defaults?.dictionary(forKey: "liveContainerAutoRefreshVerification")?["run_id"] as? String
+        return V3SetupCompletionInputs(
+            accountComplete: !status.needsSignIn,
+            provisioningIncomplete: status.provisioningIncomplete,
+            pairingSatisfied: !V3RefreshPrerequisite.evaluate(pairingStatus: status.pairing).blocksRefresh,
+            // JIT-Less is only a prerequisite on the platforms that require it.
+            jitlessRequired: V3JITLessCompletionPolicy.isRequired(
+                osMajor: ProcessInfo.processInfo.operatingSystemVersion.majorVersion),
+            // V3_SHARED_JITLESS_FACT_V1: Home reads the same observed readiness the
+            // Setup Assistant uses. It previously hard-coded "incomplete wherever
+            // JIT-Less is required", so a verified copy left the banner up forever
+            // while the assistant showed the item complete.
+            jitlessComplete: V3JITLessCompletionPolicy.isComplete(status.jitlessReadiness),
+            networkComplete: status.wifiAvailable == true,
+            tunnelComplete: LiveContainerNetworkPreflight.hasTunnelInterface(),
+            backgroundRefreshAvailable: UIApplication.shared.backgroundRefreshStatus == .available,
+            scheduleEnabled: defaults?.bool(forKey: "liveContainerAutoRefreshEnabled") ?? false,
+            verifiedRefreshPresent: verifiedRunID?.isEmpty == false)
     }
+
     var body: some View {
         NavigationView {
             List {
                 Section {
                     VStack(alignment: .leading, spacing: 14) {
-                        HStack(spacing: 12) {
-                            Image(systemName: "shippingbox.circle.fill")
-                                .font(.system(size: 38))
-                                .foregroundColor(.accentColor)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("LiveContainer + SideStore")
-                                    .font(.headline)
-                                HStack(spacing: 6) {
-                                    Circle()
-                                        .fill(status.connected ? Color.green : (status.loading ? Color.orange : Color.gray))
-                                        .frame(width: 8, height: 8)
-                                    Text(status.connected ? "Active & Connected" : (status.loading ? "Connecting..." : "Not Connected"))
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-                                }
-                            }
-                            Spacer()
-                            Button {
-                                status.reload()
-                            } label: {
-                                Image(systemName: "arrow.clockwise")
-                                    .font(.system(size: 14, weight: .semibold))
-                            }
-                            .buttonStyle(.bordered)
-                            .buttonBorderShape(.capsule)
-                            .disabled(status.loading)
+                        V3HomeServiceHeader(isConnected: status.connected, isLoading: status.loading,
+                                            updatedAt: status.updatedAt) {
+                            status.reload()
                         }
                         
                         Divider()

@@ -45,13 +45,13 @@ public enum RefreshTransportPolicy {
             return .init(transport: .remotePairing, reason: "RemotePairing-only record; not CoreDevice proof")
         }
         if modernOS && coreDeviceSupported {
-            return .init(transport: .coreDevice, reason: "iOS>=26.4 local VPN with Lockdown record and patched CoreDevice backend; initialization pending")
+            return .init(transport: .coreDevice, reason: "iOS>=17.0 local VPN with Lockdown record and patched CoreDevice backend; initialization pending")
         }
         if ipsec {
             return .init(transport: .lockdownIPSec, reason: "Upstream Lockdown with utun and IPSec interfaces")
         }
         if !modernOS {
-            return .init(transport: .lockdownLegacy, reason: "Preserve upstream Lockdown below iOS26.4")
+            return .init(transport: .lockdownLegacy, reason: "Preserve upstream Lockdown below iOS 17.0")
         }
         return .init(transport: .unavailable, reason: "Selected backend has no CoreDevice implementation and IPSec is absent")
     }
@@ -112,7 +112,7 @@ CONFIGURE = r'''
     @discardableResult
     private func configureRefreshTransport() async -> RefreshTransportDecision {
         let modernOS: Bool
-        if #available(iOS 26.4, *) { modernOS = true } else { modernOS = false }
+        if #available(iOS 17.0, *) { modernOS = true } else { modernOS = false }
         let mode = await getConnectionMode()
         let utun = network.isUTunAvailable
         let ipsec = network.isIKEv2IPSecAvailable
@@ -336,6 +336,9 @@ def patch(minimuxer: Path):
     sidestore = minimuxer.parent.parent
     runner = sidestore / "SideStore/Core/Operations/PipelineRunner.swift"
     def pipeline(text):
+        text = replace_once(text, "let opError = error.asOperationError",
+            "let opError = V3HeadlessPairingFailure.tagIfInvalidPairing(error.asOperationError)",
+            "preserve typed pairing failure through Minimuxer readiness conversion")
         if "        /* Minimuxer Readiness Check */" in text and "        try await Task.detached {" not in text:
             # ff25922 removed the redundant detached task. Retain its structured
             # cancellation, CellularRefreshManager gate and MainActor completion.
@@ -500,6 +503,9 @@ def verify(root):
     wrapper = root.parent.parent / "SideStore/Core/DeviceApi/MinimuxerWrapper.swift"
     if wrapper.is_file() and "createCoreDevice" not in wrapper.read_text(encoding="utf-8"):
         raise SystemExit("MinimuxerWrapper missing transport error mapping")
+    runner = root.parent.parent / "SideStore/Core/Operations/PipelineRunner.swift"
+    if runner.is_file() and "V3HeadlessPairingFailure.tagIfInvalidPairing(error.asOperationError)" not in runner.read_text(encoding="utf-8"):
+        raise SystemExit("PipelineRunner drops typed invalid-pairing semantics after Minimuxer conversion")
 
 
 if __name__ == "__main__":

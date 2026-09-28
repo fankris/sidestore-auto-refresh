@@ -16,6 +16,8 @@ import tempfile
 MARKER = "V3_UNIFIED_SHELL_V1_BEGIN"
 TEMPLATE = Path(__file__).with_name("templates") / "v3_unified_shell.swift"
 INTENT_TEMPLATE = Path(__file__).with_name("templates") / "v3_setup_intent.swift"
+BEHAVIOR_TEMPLATE = Path(__file__).with_name("templates") / "v3_behavioral_primitives.swift"
+IPA_STAGING_TEMPLATE = Path(__file__).with_name("templates") / "v3_ipa_staging.swift"
 
 
 def die(message: str) -> None:
@@ -48,7 +50,9 @@ def patch_host(root: Path) -> None:
         app.write_text(text, encoding="utf-8")
 
     shell = root / "LiveContainerSwiftUI/Views/V3UnifiedShell.swift"
-    expected = TEMPLATE.read_text(encoding="utf-8")
+    expected = (BEHAVIOR_TEMPLATE.read_text(encoding="utf-8") + "\n" +
+                IPA_STAGING_TEMPLATE.read_text(encoding="utf-8") + "\n" +
+                TEMPLATE.read_text(encoding="utf-8"))
     if shell.exists() and shell.read_text(encoding="utf-8") != expected:
         die("existing v3 shell differs from the current template")
     shell.write_text(expected, encoding="utf-8")
@@ -61,6 +65,45 @@ def patch_host(root: Path) -> None:
 
     settings = root / "LiveContainerSwiftUI/Views/Settings/LCSettingsView.swift"
     text = settings.read_text(encoding="utf-8")
+    if "V3_CANONICAL_JITLESS_ROUTE_V1" not in text:
+        text = replace_once(
+            text,
+            '    @State private var certificateDataFound = false',
+            '    @State private var certificateDataFound = false\n    @State private var v3OpenJITLessDiagnose = false // V3_CANONICAL_JITLESS_ROUTE_V1',
+            "canonical JIT-Less diagnose route state")
+        text = replace_once(
+            text,
+            '    func handleURL(url: URL) {\n        if url.host == "certificate" {',
+            '    func handleURL(url: URL) {\n        if url.host == "jitless-setup" {\n            Task { await importCertificateFromSideStore() }\n            return\n        }\n        if url.host == "jitless-diagnose" {\n            v3OpenJITLessDiagnose = true\n            return\n        }\n        if url.host == "certificate" {',
+            "canonical JIT-Less setup and diagnose deep links")
+        text = replace_once(
+            text,
+            '        certificateDataFound = true\n    }',
+            '        certificateDataFound = true\n        NotificationCenter.default.post(name: Notification.Name("V3CanonicalJITLessCertificateUpdated"), object: nil)\n    }',
+            "canonical JIT-Less import completion event")
+    # The programmatic route is required, but a NavigationLink placed as a Form
+    # child is a List row participant: SwiftUI still allocates a row and its
+    # minimum height for it, so the user sees a blank cell. Upstream uses this
+    # exact pattern inside a ScrollView, where there are no rows, which is why it
+    # looked harmless there. The link is therefore attached as a background of
+    # the Form, which is laid out outside the row structure entirely, so no row
+    # and no accessibility element is produced. Guarded on its own marker so a
+    # tree patched by an earlier revision is upgraded in place.
+    if "V3_JITLESS_ROUTE_ROW_NEUTRALIZED_V1" not in text:
+        text = replace_once(
+            text,
+            '            .navigationBarTitle("lc.tabView.settings".loc)',
+            '            // V3_JITLESS_ROUTE_ROW_NEUTRALIZED_V1: a background is laid out\n'
+            '            // outside the Form row structure, so this programmatic route cannot\n'
+            '            // produce an empty Settings row at any text size or device width, and\n'
+            '            // leaves no accessibility ghost element.\n'
+            '            .background(\n'
+            '                NavigationLink(destination: LCJITLessDiagnoseView(), isActive: $v3OpenJITLessDiagnose) { EmptyView() }\n'
+            '                    .hidden()\n'
+            '            )\n'
+            '            .navigationBarTitle("lc.tabView.settings".loc)',
+            "canonical JIT-Less diagnose navigation")
+    settings.write_text(text, encoding="utf-8")
     old = '''                if store == .SideStore {
                     Section {
                         NavigationLink { LCEmbeddedSideStoreRefreshView() } label: { Text("SideStore scheduled refresh") }
@@ -129,7 +172,8 @@ def verify(live: Path, side: Path) -> None:
     shell = required[0].read_text(encoding="utf-8")
     for token in (MARKER, "V3SideStoreStatusStore", "V3SourcesView", "LCEmbeddedSideStoreRefreshView", "LCTabIdentifier.settings",
                   "V3SignInView", "V3CertificatesView", "V3PromptSection", "V3PairingView", "V3AuthStore",
-                  "V3SetupAssistantView", "V3SetupStore", "setupPresented"):
+                  "V3SetupAssistantView", "V3SetupStore", "setupPresented", "V3JITLessStatusReader",
+                  "pendingCanonicalJITLessSetup", "livecontainer://jitless-setup"):
         if token not in shell:
             die(f"v3 shell is missing {token}")
     for forbidden in ("V3RemoteServiceView", "Self.presenter", "presentingViewController: Self.presenter"):
@@ -143,6 +187,13 @@ def verify(live: Path, side: Path) -> None:
     app_list = (live / "LiveContainerSwiftUI/Views/AppList/LCAppListView.swift").read_text(encoding="utf-8")
     if "V3_UNIFIED_SHELL_V1: SideStore is reached through unified tabs." not in app_list:
         die("legacy SideStore launch button removal marker is missing from the Apps screen")
+    settings_source = (live / "LiveContainerSwiftUI/Views/Settings/LCSettingsView.swift").read_text(encoding="utf-8")
+    for token in ("V3_CANONICAL_JITLESS_ROUTE_V1", "importCertificateFromSideStore()",
+                  "v3OpenJITLessDiagnose = true", "V3CanonicalJITLessCertificateUpdated"):
+        if token not in settings_source:
+            die(f"canonical LiveContainer JIT-Less route is missing {token}")
+    if "V3_JITLESS_ROUTE_ROW_NEUTRALIZED_V1" not in settings_source:
+        die("canonical JIT-Less route is not row-neutralized (an empty Settings row would render)")
     if "V3_SIDESTORE_STATUS_SNAPSHOT_V1" not in (side / "AltStore/AppDelegate.swift").read_text(encoding="utf-8"):
         die("embedded SideStore snapshot retirement marker is missing")
     compiler = shutil.which("swiftc")

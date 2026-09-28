@@ -11,13 +11,111 @@ MARKER = "LC_SERVICE_CONNECTION_V1"
 OUTPUTS = {(0, name) for name in ("SideStoreSupport/SideStore.swift", "LiveContainer/LCContainerStorage.h",
     "LiveContainer/LCBootstrap.m", "SideStoreSupport/XPCServer.h", "SideStoreSupport/XPCServer.m",
     "SideStoreSupport/SideStoreClient.swift", "LiveContainerSwiftUI/Views/Settings/LCSettingsView.swift")} | {
-    (1, "AltStore/AppDelegate.swift"), (1, "SideStore/Core/Operations/PipelineExecutor.swift")}
+    (1, "AltStore/AppDelegate.swift"), (1, "SideStore/Core/Operations/PipelineExecutor.swift"),
+    (1, "SideStore/Core/Operations/PipelineRunner.swift")}
+
+SIGNING_CAUSE_HELPER = '''
+// LC_SIGNING_CAUSE_CLASSIFIER_V1: only typed upstream errors gain a semantic cause.
+func lcSafeSigningCause(_ error: Error) -> String {
+    if let urlError = error as? URLError {
+        switch urlError.code {
+        case .networkConnectionLost: return "signingNetworkConnectionLost"
+        case .timedOut: return "signingNetworkTimedOut"
+        case .notConnectedToInternet, .cannotConnectToHost, .cannotFindHost:
+            return "signingNetworkUnavailable"
+        default: break
+        }
+    }
+    let native = error as NSError
+    if native.domain == NSURLErrorDomain {
+        switch native.code {
+        case NSURLErrorNetworkConnectionLost: return "signingNetworkConnectionLost"
+        case NSURLErrorTimedOut: return "signingNetworkTimedOut"
+        case NSURLErrorNotConnectedToInternet, NSURLErrorCannotConnectToHost, NSURLErrorCannotFindHost:
+            return "signingNetworkUnavailable"
+        default: break
+        }
+    }
+    if let serverError = error as? ServerError {
+        switch serverError {
+        case .underlyingError: return "developerPortalRejectedRequest"
+        case .badServerResponse, .invalidResponseFormat, .missingKey:
+            return "developerPortalInvalidResponse"
+        }
+    }
+    if let portalError = error as? DeveloperPortalError {
+        switch portalError {
+        case .provisioningProfileDoesNotExist: return "provisioningProfileUnavailable"
+        case .certificateDoesNotExist: return "certificateUnavailable"
+        default: break
+        }
+    }
+    return "unknownSigningCause"
+}
+'''
+
+PIPELINE_FAILURE_HANDLER = r'''            result = error
+            // LC_STRUCTURED_FAILURE_V1: preserve step responsibility and the underlying error.
+            var stage: String
+            switch step {
+            case .resignApp, .fetchProvisioningProfiles, .verifyCertificate: stage = "signing"
+            case .sendApp, .installApp: stage = "installation"
+            default: stage = "command"
+            }
+            var sourceStep: String?
+            switch step {
+            case .fetchProvisioningProfiles: sourceStep = "provisioningProfileFetch"
+            case .verifyCertificate: sourceStep = "certificateValidation"
+            case .resignApp: sourceStep = "localCodeSigning"
+            default: break
+            }
+            if let operationError = error as? OperationError, operationError == .notAuthenticated { stage = "authentication" }
+            if let portalError = error as? DeveloperPortalError {
+                switch portalError {
+                case .incorrectCredentials, .appSpecificPasswordRequired, .requiresTwoFactorAuthentication,
+                     .incorrectVerificationCode, .authenticationHandshakeFailed, .invalidAnisetteData,
+                     .tooManyAttempts, .accountRepairRequired, .invalid2FAResponse: stage = "authentication"
+                default: break
+                }
+            }
+            let safeCause = stage == "signing" ? lcSafeSigningCause(error) : nil
+            let native = error as NSError
+            var failureInfo: [String: Any] = ["LCStructuredFailureStageV1": stage,
+                NSUnderlyingErrorKey: native, NSLocalizedDescriptionKey: native.localizedDescription]
+            if let safeCause { failureInfo["LCStructuredFailureCauseV1"] = safeCause }
+            if let sourceStep { failureInfo["LCStructuredFailureSourceV1"] = sourceStep }
+            throw NSError(domain: native.domain, code: native.code,
+                userInfo: failureInfo)'''
 
 
 def replace(text, old, new):
     if text.count(old) != 1:
         raise SystemExit("combined startup anchor drift: " + old[:90])
     return text.replace(old, new, 1)
+
+
+def patch_pipeline_executor(text, product="v3"):
+    if "LC_SIGNING_CAUSE_CLASSIFIER_V1" in text or "LC_STRUCTURED_FAILURE_V1" in text:
+        raise SystemExit("pinned pipeline already contains the structured signing adapter")
+    if product == "v3":
+        text = replace(text, "        do {\n            switch step {", '''        // V3_PIPELINE_PHASE_REPORTING_V1: report the authoritative step before it runs.
+        if let headlessHandler = context.handler as? V3HeadlessPipelineHandler {
+            await headlessHandler.recordPipelinePhase(step,
+                downloadUsesNetwork: downloadingApp.url?.isFileURL == false)
+        }
+        do {
+            switch step {''')
+    return replace(text, "            result = error\n            throw error",
+                   PIPELINE_FAILURE_HANDLER) + SIGNING_CAUSE_HELPER
+
+
+def patch_pipeline_runner(text):
+    marker = "V3_PROGRESS_BASELINE_FIX_V1"
+    if marker in text:
+        raise SystemExit("pinned runner already contains the progress baseline fix")
+    return replace(text, "        group.progress.completedUnitCount = 1",
+        "        // V3_PROGRESS_BASELINE_FIX_V1: child weights already span the full total.\n"
+        "        group.progress.completedUnitCount = 0")
 
 
 def patch(live, side, product):
@@ -47,8 +145,14 @@ def patch(live, side, product):
     def template(name):
         return (TEMPLATES / name).read_text(encoding="utf-8")
     def host(text):
-        text = replace(text, 'return .result(dialog: "All apps have been refreshed.")',
-            'return .result(dialog: "Refresh request completed. Check Refresh for verified installation results.")')
+        old_result = 'return .result(dialog: "All apps have been refreshed.")'
+        requested_result = 'return .result(dialog: "Refresh All was requested in LiveContainer. Check Refresh History for the run result.")'
+        if old_result in text:
+            text = replace(text, old_result,
+                requested_result if product == "v3" else
+                'return .result(dialog: "Refresh request completed. Check Refresh for verified installation results.")')
+        elif product == "v3" and requested_result not in text:
+            raise SystemExit("combined startup anchor drift: Refresh All request result copy")
         text = text.replace("        RefreshHandler.shared.progress = intentProgress", "        await MainActor.run { RefreshHandler.shared.progress = intentProgress }")
         start = text.index("class RefreshHandler:")
         if text[max(0, start-11):start] == "@MainActor\n": start -= 11
@@ -60,27 +164,29 @@ def patch(live, side, product):
         handler = template("combined_refresh_handler.swift")
         handler = handler.replace("/*MUTATION_GUARD*/", ", !V3ServiceBridge.shared.isMutating" if product == "v3" else "")
         handler = handler.replace("/*DISCONNECTED*/", "V3ServiceBridge.shared.disconnected()" if product == "v3" else "")
-        handler = handler.replace("/*REFRESH_READINESS*/", '''
-        let status = try await V3ServiceBridge.shared.request(operation: "snapshot")
-        guard status["busy"] as? Bool == false else {
-            throw CombinedFailure(operation: "refresh", stage: .serviceReadiness, code: .busy, id: token.uuidString, retryable: true)
-        }''' if product == "v3" else "")
+        handler = handler.replace("/*REFRESH_READINESS*/", "")
         handler = handler.replace("/*SERVICE_PROBE*/", '''
         let until = Date().addingTimeInterval(30)
+        var backoff = V3ServiceReadinessBackoff()
         var ready = false
         var pending = false
         var invalid = false
-        var lastSnapshotError = ""
-        while Date() < until {
+        while true {
             try Task.checkCancellation()
             guard launchID == id else { throw CancellationError() }
-            if ready {
+            switch V3ServiceReadinessProbeState.resolve(
+                ready: ready, invalid: invalid, expired: Date() >= until) {
+            case .ready:
                 NSLog("[V3_SERVICE_START] SNAPSHOT_READY id=%@", id.uuidString)
                 return
-            }
-            if invalid {
-                NSLog("[V3_SERVICE_START] READINESS_INVALID_RESPONSE id=%@ error=%@", id.uuidString, lastSnapshotError)
+            case .invalid:
+                NSLog("[V3_SERVICE_START] READINESS_INVALID_RESPONSE id=%@", id.uuidString)
                 throw CombinedFailure(operation: "connect", stage: .serviceReadiness, code: .invalidResponse, id: id.uuidString)
+            case .timedOut:
+                NSLog("[V3_SERVICE_START] READINESS_TIMEOUT id=%@", id.uuidString)
+                throw CombinedFailure(operation: "connect", stage: .serviceReadiness, code: .timedOut, id: id.uuidString, retryable: true)
+            case .pending:
+                break
             }
             if !pending, let client {
                 let requestID = UUID().uuidString
@@ -91,19 +197,17 @@ def patch(live, side, product):
                     Task { @MainActor in
                         guard self.launchID == id else { return }
                         pending = false
-                        guard response.count <= V3WireContract.responseLimit,
-                              let result = try? PropertyListSerialization.propertyList(from: response, format: nil) as? [String: Any],
-                              result["id"] as? String == requestID else { invalid = true; return }
-                        if let replyError = result["error"] as? String { lastSnapshotError = replyError }
-                        else if result["ok"] as? Bool != true { lastSnapshotError = "missing-ok" }
-                        ready = result["ok"] as? Bool == true
+                        switch V3ServiceReadinessReply.decode(response, requestID: requestID) {
+                        case .invalid: invalid = true
+                        case .failed(_): break
+                        case .ready: ready = true
+                        }
                     }
                 }
             }
-            try await Task.sleep(nanoseconds: 200_000_000)
+            guard let delay = backoff.nextDelay(remaining: until.timeIntervalSinceNow) else { continue }
+            try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
         }
-        NSLog("[V3_SERVICE_START] READINESS_TIMEOUT id=%@ lastError=%@", id.uuidString, lastSnapshotError)
-        throw CombinedFailure(operation: "connect", stage: .serviceReadiness, code: .timedOut, id: id.uuidString, retryable: true)
 ''' if product == "v3" else '''
         // v2 has no command catalog. App launch readiness is distinct from database readiness,
         // which remains owned by the subsequent explicit refresh intent.
@@ -165,28 +269,9 @@ extension SideStoreClient {
 '''
     edit(live, "SideStoreSupport/SideStoreClient.swift", client)
     edit(side, "AltStore/AppDelegate.swift", lambda s: s + template("combined_failure.swift"))
-    edit(side, "SideStore/Core/Operations/PipelineExecutor.swift", lambda s: replace(s,
-        "            result = error\n            throw error", '''            result = error
-            // LC_STRUCTURED_FAILURE_V1: preserve step responsibility and the underlying error.
-            var stage: String
-            switch step {
-            case .resignApp, .fetchProvisioningProfiles, .verifyCertificate: stage = "signing"
-            case .sendApp, .installApp: stage = "installation"
-            default: stage = "command"
-            }
-            if let operationError = error as? OperationError, operationError == .notAuthenticated { stage = "authentication" }
-            if let portalError = error as? DeveloperPortalError {
-                switch portalError {
-                case .incorrectCredentials, .appSpecificPasswordRequired, .requiresTwoFactorAuthentication,
-                     .incorrectVerificationCode, .authenticationHandshakeFailed, .invalidAnisetteData,
-                     .tooManyAttempts, .accountRepairRequired, .invalid2FAResponse: stage = "authentication"
-                default: break
-                }
-            }
-            let native = error as NSError
-            throw NSError(domain: native.domain, code: native.code,
-                userInfo: ["LCStructuredFailureStageV1": stage, NSUnderlyingErrorKey: native,
-                           NSLocalizedDescriptionKey: native.localizedDescription])'''))
+    edit(side, "SideStore/Core/Operations/PipelineExecutor.swift",
+         lambda s: patch_pipeline_executor(s, product))
+    edit(side, "SideStore/Core/Operations/PipelineRunner.swift", patch_pipeline_runner)
     edit(live, "LiveContainerSwiftUI/Views/Settings/LCSettingsView.swift", lambda s: replace(s,
         "                if sharedModel.developerMode {", '''                Section("Build Candidate") {
                     Text("Product: " + (Bundle.main.object(forInfoDictionaryKey: "LCProductLine") as? String ?? "unknown"))

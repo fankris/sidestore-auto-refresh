@@ -1,4 +1,29 @@
 // LC_SERVICE_CONNECTION_V1: platform adapter, with explicit refresh compatibility entry points.
+enum V3ServiceReadinessProbeState: Equatable {
+    case pending
+    case ready
+    case invalid
+    case timedOut
+
+    static func resolve(ready: Bool, invalid: Bool, expired: Bool) -> V3ServiceReadinessProbeState {
+        if ready { return .ready }
+        if invalid { return .invalid }
+        return expired ? .timedOut : .pending
+    }
+}
+
+struct V3ServiceReadinessBackoff {
+    private(set) var delay: TimeInterval = 0.2
+    static let maximumDelay: TimeInterval = 1.0
+
+    mutating func nextDelay(remaining: TimeInterval) -> TimeInterval? {
+        guard remaining.isFinite, remaining > 0 else { return nil }
+        let result = min(delay, remaining)
+        delay = min(delay * 2, Self.maximumDelay)
+        return result
+    }
+}
+
 @MainActor
 class RefreshHandler: NSObject {
     static let shared = RefreshHandler()
@@ -6,6 +31,8 @@ class RefreshHandler: NSObject {
     var sideStorePid: Int32 = 0
     var client: RefreshClient?
     var v3RefreshToken: UUID?
+    var v3RefreshAdmissionRunID: String?
+    var v3RefreshDispatchedRunID: String?
     private var extensionProcess: NSExtension?
     private var listener: NSXPCListener?
     private var connection: NSXPCConnection?
@@ -189,42 +216,183 @@ class RefreshHandler: NSObject {
 
     // Compatibility adapter for existing AppIntents and scheduler ABI. This always means refresh.
     func startRefresh(identifier: String, mangledName: String) async throws {
-        try await performRefresh(identifier: identifier, mangledName: mangledName)
+        try await performRefresh(identifier: identifier, mangledName: mangledName, schedulerRunID: nil)
+    }
+    func startScheduledRefresh(identifier: String, mangledName: String, runID: String) async throws {
+        try await performRefresh(identifier: identifier, mangledName: mangledName, schedulerRunID: runID)
     }
     func performRefresh(identifier: String, mangledName: String) async throws {
+        try await performRefresh(identifier: identifier, mangledName: mangledName, schedulerRunID: nil)
+    }
+    private func performRefresh(identifier: String, mangledName: String,
+                                schedulerRunID: String?) async throws {
         guard !identifier.isEmpty, !mangledName.isEmpty else {
             throw CombinedFailure(operation: "refresh", stage: .command, code: .invalidConfiguration, id: UUID().uuidString)
         }
-        guard v3RefreshToken == nil /*MUTATION_GUARD*/ else {
-            throw CombinedFailure(operation: "refresh", stage: .command, code: .busy, id: UUID().uuidString, retryable: true)
+        let defaults = UserDefaults(suiteName: "group.com.SideStore.SideStore")
+        guard let sharedDefaults = defaults else {
+            throw CombinedFailure(operation: "refresh", stage: .xpcConnection,
+                code: .invalidConfiguration, id: UUID().uuidString)
         }
-        let token = UUID(); v3RefreshToken = token
-        defer { if v3RefreshToken == token { v3RefreshToken = nil } }
+        if schedulerRunID == nil && V3DirectRefreshPreflightPolicy.isBlocked(
+            activeRunID: sharedDefaults.string(forKey: "liveContainerAutoRefreshActiveRunID"),
+            hostHandoffPending: sharedDefaults.bool(forKey: "liveContainerAutoRefreshHostHandoff"),
+            uncertainMutationRunID: sharedDefaults.string(forKey: "liveContainerAutoRefreshUncertainMutationRunID")) {
+            throw CombinedFailure(operation: "refresh", stage: .command, code: .busy,
+                id: UUID().uuidString, retryable: true, safeCause: .operationInProgress)
+        }
+        // Connect and verify service readiness before claiming local mutation
+        // state. The authoritative refreshAdmissionBegin request serializes
+        // against active service mutations below, so a separate full snapshot
+        // here would only duplicate the readiness probe.
         try await ensureServiceConnected()
         /*REFRESH_READINESS*/
         try Task.checkCancellation()
-        let defaults = UserDefaults(suiteName: "group.com.SideStore.SideStore")
-        let run = defaults?.string(forKey: "liveContainerAutoRefreshExpectedRunID") ?? UUID().uuidString
-        guard UUID(uuidString: run) != nil, let client else {
+        guard v3RefreshToken == nil /*MUTATION_GUARD*/ else {
+            throw CombinedFailure(operation: "refresh", stage: .command, code: .busy,
+                id: UUID().uuidString, retryable: true, safeCause: .operationInProgress)
+        }
+        // The connection startup above suspends. Recheck shared scheduler
+        // ownership after resuming so a handoff or uncertain mutation created
+        // during that await cannot be overwritten by this direct run.
+        if schedulerRunID == nil && V3DirectRefreshPreflightPolicy.isBlocked(
+            activeRunID: sharedDefaults.string(forKey: "liveContainerAutoRefreshActiveRunID"),
+            hostHandoffPending: sharedDefaults.bool(forKey: "liveContainerAutoRefreshHostHandoff"),
+            uncertainMutationRunID: sharedDefaults.string(forKey: "liveContainerAutoRefreshUncertainMutationRunID")) {
+            throw CombinedFailure(operation: "refresh", stage: .command, code: .busy,
+                id: UUID().uuidString, retryable: true, safeCause: .operationInProgress)
+        }
+        let token = UUID(); v3RefreshToken = token
+        defer { if v3RefreshToken == token { v3RefreshToken = nil } }
+        let directClaimID = schedulerRunID == nil ? UUID().uuidString : nil
+        if let directClaimID {
+            let existingClaim = sharedDefaults.dictionary(forKey: V3DirectRefreshRunClaimPolicy.defaultsKey)
+            guard !V3DirectRefreshRunClaimPolicy.isActive(
+                runID: existingClaim?["run_id"] as? String,
+                deadline: existingClaim?["deadline"] as? Date) else {
+                throw CombinedFailure(operation: "refresh", stage: .command, code: .busy,
+                    id: directClaimID, retryable: true, safeCause: .operationInProgress)
+            }
+            sharedDefaults.set(["run_id": directClaimID,
+                // Cover the bounded XPC admission handshake; renew immediately
+                // once the backend lease is authoritative.
+                "deadline": Date().addingTimeInterval(V3RefreshAdmissionLease.lifetime + 60)],
+                forKey: V3DirectRefreshRunClaimPolicy.defaultsKey)
+        }
+        defer {
+            if let directClaimID,
+               sharedDefaults.dictionary(forKey: V3DirectRefreshRunClaimPolicy.defaultsKey)?["run_id"] as? String == directClaimID {
+                sharedDefaults.removeObject(forKey: V3DirectRefreshRunClaimPolicy.defaultsKey)
+            }
+        }
+        let selectedRun = V3RefreshRunIdentitySelection.select(
+            schedulerRunID: schedulerRunID,
+            expectedRunID: defaults?.string(forKey: "liveContainerAutoRefreshExpectedRunID"),
+            activeRunID: defaults?.string(forKey: "liveContainerAutoRefreshActiveRunID"),
+            newRunID: directClaimID ?? UUID().uuidString)
+        guard let client else {
             throw CombinedFailure(operation: "refresh", stage: .xpcConnection, code: .invalidConfiguration, id: token.uuidString)
         }
+        guard let selectedRun else {
+            if let schedulerRunID {
+                // Identity validation rejects this before service admission or
+                // device dispatch. This is a stale scheduler request, not an
+                // uncertain installation result that needs reconciliation.
+                throw CombinedFailure(operation: "refresh", stage: .command,
+                    code: .staleResult, id: schedulerRunID, retryable: false,
+                    safeCause: .staleRefreshAttempt)
+            }
+            throw CombinedFailure(operation: "refresh", stage: .command,
+                code: .busy, id: token.uuidString, retryable: true,
+                safeCause: .operationInProgress)
+        }
+        let run = selectedRun.runID
+        guard v3RefreshAdmissionRunID == nil else {
+            throw CombinedFailure(operation: "refresh", stage: .serviceReadiness,
+                code: .busy, id: run, retryable: true, safeCause: .operationInProgress)
+        }
+        v3RefreshAdmissionRunID = run
+        defer { if v3RefreshAdmissionRunID == run { v3RefreshAdmissionRunID = nil } }
+        defer { if v3RefreshDispatchedRunID == run { v3RefreshDispatchedRunID = nil } }
+        // Reserve mutation ownership through the SideStore command gate before
+        // starting the legacy XPC refresh path. Authentication and refresh
+        // admission are serialized there.
+        let admission = try await V3ServiceBridge.shared.request(
+            operation: "refreshAdmissionBegin", target: run)
+        guard admission["runID"] as? String == run,
+              V3ServiceBridge.strictBool(admission["admitted"]) == true else {
+            throw CombinedFailure(operation: "refresh", stage: .command,
+                code: .busy, id: run, retryable: true, safeCause: .operationInProgress)
+        }
+        if let directClaimID {
+            sharedDefaults.set(["run_id": directClaimID,
+                "deadline": Date().addingTimeInterval(V3RefreshAdmissionLease.lifetime)],
+                forKey: V3DirectRefreshRunClaimPolicy.defaultsKey)
+        }
         defaults?.set(run, forKey: "liveContainerAutoRefreshExpectedRunID")
+        defer {
+            if !selectedRun.schedulerOwned,
+               defaults?.string(forKey: "liveContainerAutoRefreshExpectedRunID") == run {
+                defaults?.removeObject(forKey: "liveContainerAutoRefreshExpectedRunID")
+            }
+        }
         refreshRunID = run
         let timeout = Task { @MainActor in
-            do { try await Task.sleep(nanoseconds: 600_000_000_000) } catch { return }
+            do {
+                try await Task.sleep(nanoseconds: V3RefreshAdmissionLease.nativeRefreshTimeoutNanoseconds)
+            } catch { return }
             guard self.v3RefreshToken == token else { return }
             self.finishRefreshContinuation(.failure(CombinedFailure(operation: "refresh", stage: .refreshVerification, code: .timedOut, id: run)))
             self.service.stop()
         }
         defer { timeout.cancel() }
-        try await withTaskCancellationHandler(operation: {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                if Task.isCancelled { continuation.resume(throwing: CancellationError()); return }
-                refreshContinuation = continuation
-                defaults?.set(run, forKey: "liveContainerAutoRefreshUncertainMutationRunID")
-                client.refreshAllApps(withIdentifier: identifier, mangledTypeName: mangledName, refreshRunID: run)
+        do {
+            try await withTaskCancellationHandler(operation: {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    if Task.isCancelled { continuation.resume(throwing: CancellationError()); return }
+                    refreshContinuation = continuation
+                    defaults?.set(run, forKey: "liveContainerAutoRefreshUncertainMutationRunID")
+                    v3RefreshDispatchedRunID = run
+                    client.refreshAllApps(withIdentifier: identifier, mangledTypeName: mangledName, refreshRunID: run)
+                }
+            }, onCancel: { Task { @MainActor in
+                if self.v3RefreshToken == token && self.v3RefreshDispatchedRunID == run {
+                    self.v3_stopService()
+                }
+            } })
+        } catch {
+            timeout.cancel()
+            // Before native dispatch, cancellation only needs to release the
+            // admission lease. After dispatch, timeout/cancellation retires the
+            // SideStore process, so avoid reconnecting to release its old state.
+            if v3RefreshDispatchedRunID != run ||
+               (!Task.isCancelled && !(error is CancellationError) &&
+                (error as? CombinedFailure)?.code != .timedOut) {
+                await releaseRefreshAdmission(run)
             }
-        }, onCancel: { Task { @MainActor in if self.v3RefreshToken == token { self.v3_stopService() } } })
+            throw error
+        }
+        timeout.cancel()
+        await releaseRefreshAdmission(run)
+    }
+    private func releaseRefreshAdmission(_ runID: String) async {
+        // Run independently of a caller cancellation so a confirmed terminal
+        // callback cannot strand the service's admission state.
+        await Task { @MainActor in
+            do {
+                let reply = try await V3ServiceBridge.shared.request(
+                    operation: "refreshAdmissionEnd", target: runID)
+                guard reply["runID"] as? String == runID,
+                      V3ServiceBridge.strictBool(reply["released"]) == true else {
+                    NSLog("[V3_REFRESH_ADMISSION] RELEASE_UNCONFIRMED run_id=%@", runID)
+                    self.v3_stopService()
+                    return
+                }
+            } catch {
+                NSLog("[V3_REFRESH_ADMISSION] RELEASE_UNCONFIRMED run_id=%@", runID)
+                self.v3_stopService()
+            }
+        }.value
     }
     private func finishRefreshContinuation(_ result: Result<Void, Error>) {
         let pending = refreshContinuation; refreshContinuation = nil; refreshRunID = nil

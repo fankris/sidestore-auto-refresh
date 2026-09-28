@@ -262,7 +262,8 @@ class StartupPatchTests(unittest.TestCase):
         roots = (directory / "live", directory / "side")
         paths = (["SideStoreSupport/" + name for name in ("SideStore.swift", "SideStoreClient.swift", "XPCServer.m", "XPCServer.h", "XPCClient.m")] +
                  ["LiveContainer/LCBootstrap.m", "LiveContainerSwiftUI/Views/Settings/LCSettingsView.swift"],
-                 ["AltStore/AppDelegate.swift", "SideStore/Core/Operations/PipelineExecutor.swift"])
+                 ["AltStore/AppDelegate.swift", "SideStore/Core/Operations/PipelineExecutor.swift",
+                  "SideStore/Core/Operations/PipelineRunner.swift"])
         for source, root, pin, files in zip((live_source, side_source), roots, startup.PINS, paths):
             for name in files:
                 path = root / name; path.parent.mkdir(parents=True, exist_ok=True)
@@ -310,6 +311,128 @@ class StartupPatchTests(unittest.TestCase):
 
 
 class ReadinessRegressionTests(unittest.TestCase):
+    def test_startup_probe_uses_bounded_backoff_and_terminal_policy(self):
+        patcher = (ROOT / "scripts/patch_combined_service_startup.py").read_text(encoding="utf-8")
+        probe = patcher[patcher.index('handler = handler.replace("/*SERVICE_PROBE*/",'):]
+        probe = probe[:probe.index("''' if product == \"v3\" else")]
+        self.assertIn("while true", probe)
+        self.assertIn("V3ServiceReadinessProbeState.resolve", probe)
+        self.assertIn("backoff.nextDelay(remaining:", probe)
+        self.assertNotIn("lastSnapshotError", probe)
+
+    def test_direct_refresh_rechecks_after_connection_and_uses_service_admission(self):
+        generator = (ROOT / "scripts/patch_combined_service_startup.py").read_text(encoding="utf-8")
+        handler = (ROOT / "scripts/templates/combined_refresh_handler.swift").read_text(encoding="utf-8")
+        self.assertIn('handler = handler.replace("/*REFRESH_READINESS*/", "")', generator)
+        perform = handler[handler.index("private func performRefresh(identifier:"):]
+        perform = perform[:perform.index("private func releaseRefreshAdmission")]
+        preflights = [index for index in range(len(perform))
+                      if perform.startswith("V3DirectRefreshPreflightPolicy.isBlocked", index)]
+        self.assertEqual(len(preflights), 2,
+                         "a fast local check and a post-connect recheck must guard the non-suspending claim")
+        connected = perform.index("try await ensureServiceConnected()")
+        token = perform.index("let token = UUID()")
+        self.assertLess(preflights[0], connected)
+        self.assertLess(connected, preflights[1])
+        self.assertLess(preflights[1], token)
+        self.assertLess(token, perform.index('operation: "refreshAdmissionBegin"'))
+
+    def test_pipeline_phase_hook_is_v3_only(self):
+        source = """        do {
+            switch step {
+            default: break
+            }
+            result = error
+            throw error"""
+        generated_v2 = startup.patch_pipeline_executor(source, product="v2")
+        generated_v3 = startup.patch_pipeline_executor(source, product="v3")
+        self.assertNotIn("V3_PIPELINE_PHASE_REPORTING_V1", generated_v2)
+        self.assertIn("V3_PIPELINE_PHASE_REPORTING_V1", generated_v3)
+        self.assertIn("await headlessHandler.recordPipelinePhase(step,", generated_v3)
+        self.assertIn("downloadUsesNetwork: downloadingApp.url?.isFileURL == false", generated_v3)
+
+    def test_generated_pinned_sidesign_errors_keep_typed_signing_semantics(self):
+        compiler = shutil.which("swiftc")
+        if not compiler: self.skipTest("requires Swift; executed by combined macOS CI")
+        side_sign = os.getenv("SIDESIGN_TEST_SOURCE")
+        embedded = os.getenv("EMBEDDED_SIDESTORE_TEST_SOURCE")
+        if not side_sign or not embedded:
+            self.skipTest("pinned SideSign and SideStore sources are supplied by macOS CI")
+        errors_path = Path(side_sign) / "Sources/Models/Errors.swift"
+        pinned_errors = errors_path.read_text(encoding="utf-8")
+        self.assertIn("public enum ServerError", pinned_errors)
+        self.assertIn("case underlyingError(code: Int, message: String)", pinned_errors)
+        self.assertIn("public enum DeveloperPortalError", pinned_errors)
+        enum_start = pinned_errors.index("public enum DeveloperPortalError")
+        enum_end = pinned_errors.index("public enum SignerError", enum_start)
+        actual_side_sign_types = pinned_errors[enum_start:enum_end]
+
+        original_pipeline = subprocess.check_output([
+            "git", "-C", embedded, "show",
+            startup.PINS[1] + ":SideStore/Core/Operations/PipelineExecutor.swift"], text=True)
+        generated_pipeline = startup.patch_pipeline_executor(original_pipeline)
+        self.assertIn("lcSafeSigningCause(error)", generated_pipeline)
+        self.assertIn('sourceStep = "provisioningProfileFetch"', generated_pipeline)
+        self.assertIn("V3_PIPELINE_PHASE_REPORTING_V1", generated_pipeline)
+        self.assertIn("await headlessHandler.recordPipelinePhase(step,", generated_pipeline)
+        self.assertIn("downloadUsesNetwork: downloadingApp.url?.isFileURL == false", generated_pipeline)
+        original_runner = subprocess.check_output([
+            "git", "-C", embedded, "show",
+            startup.PINS[1] + ":SideStore/Core/Operations/PipelineRunner.swift"], text=True)
+        generated_runner = startup.patch_pipeline_runner(original_runner)
+        self.assertIn("V3_PROGRESS_BASELINE_FIX_V1", generated_runner)
+        self.assertIn("group.progress.completedUnitCount = 0", generated_runner)
+        self.assertNotIn("group.progress.completedUnitCount = 1", generated_runner)
+        helper = generated_pipeline[generated_pipeline.index("// LC_SIGNING_CAUSE_CLASSIFIER_V1"):]
+        failure_model = (ROOT / "scripts/templates/combined_failure.swift").read_text(encoding="utf-8")
+        behavioral_model = (ROOT / "scripts/templates/v3_behavioral_primitives.swift").read_text(encoding="utf-8")
+        wire_model = (ROOT / "scripts/templates/v3_wire_contract.swift").read_text(encoding="utf-8")
+        failure_model = "\n".join(line for line in failure_model.splitlines()
+                                    if not line.startswith("import "))
+        behavioral_model = "\n".join(line for line in behavioral_model.splitlines()
+                                       if not line.startswith("import "))
+        source = wire_model + """
+import Foundation
+import CoreFoundation
+enum Constants { static let defaultAccountRepairMessage = "" }
+""" + actual_side_sign_types + failure_model + behavioral_model + """
+@main struct SigningCauseTest {
+    static func main() {
+        precondition(lcSafeSigningCause(URLError(.networkConnectionLost)) == "signingNetworkConnectionLost")
+        precondition(lcSafeSigningCause(ServerError.underlyingError(code: -1005, message: "provider")) == "developerPortalRejectedRequest")
+        precondition(lcSafeSigningCause(DeveloperPortalError.certificateDoesNotExist(serial: "private")) == "certificateUnavailable")
+        precondition(lcSafeSigningCause(DeveloperPortalError.provisioningProfileDoesNotExist(identifier: "private")) == "provisioningProfileUnavailable")
+        precondition(lcSafeSigningCause(NSError(domain: "redacted", code: -1005)) == "unknownSigningCause",
+                     "numeric -1005 alone was classified as a network failure")
+        let runID = UUID().uuidString
+        let providerCause = lcSafeSigningCause(ServerError.underlyingError(code: -1005, message: "private response"))
+        let wrapped = NSError(domain: "PrivateSideSignDomain", code: -1005, userInfo: [
+            "LCStructuredFailureStageV1": "signing",
+            "LCStructuredFailureCauseV1": providerCause,
+            "LCStructuredFailureSourceV1": "provisioningProfileFetch",
+            NSUnderlyingErrorKey: NSError(domain: "PrivateProviderDomain", code: -1005)
+        ])
+        let captured = CombinedFailure.capture(wrapped, operation: "install", stage: .installation, id: runID)
+        let bridged = CombinedFailure.decode(captured.wire, expectedID: runID)!
+        let details = V3OperationFailureDetails(bridged)
+        precondition(bridged.stage == .signing && bridged.safeCause == .developerPortalRejectedRequest)
+        precondition(bridged.sourceStep == .provisioningProfileFetch && bridged.underlyingDomain == "redacted")
+        precondition(bridged.underlyingCode == -1005 && details.recoveryDestination == "certificates")
+        print("PINNED_SIDESIGN_TYPED_SIGNING_CAUSE_PASS")
+    }
+}
+""" + helper
+        with tempfile.TemporaryDirectory() as directory:
+            swift = Path(directory) / "main.swift"
+            executable = Path(directory) / "signing-cause"
+            swift.write_text(source, encoding="utf-8")
+            built = subprocess.run([compiler, "-parse-as-library", str(swift), "-o", str(executable)],
+                                   capture_output=True, text=True)
+            self.assertEqual(built.returncode, 0, built.stderr)
+            result = subprocess.run([str(executable)], capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("PINNED_SIDESIGN_TYPED_SIGNING_CAUSE_PASS", result.stdout)
+
     def test_structured_failures_are_preserved_not_rewrapped(self):
         handler = (ROOT / "scripts/templates/combined_refresh_handler.swift").read_text(encoding="utf-8")
         self.assertIn("CombinedFailure.preserving(underlying", handler)
@@ -323,6 +446,8 @@ class ReadinessRegressionTests(unittest.TestCase):
                        "SNAPSHOT_READY", "READINESS_TIMEOUT", "READINESS_INVALID_RESPONSE"):
             self.assertIn(marker, handler + startup)
         self.assertIn("id.uuidString", handler)
+        self.assertIn("V3ServiceReadinessReply.decode(response, requestID: requestID)", startup)
+        self.assertNotIn('result["ok"] as? Bool', startup)
 
     def test_reconnect_and_mutation_safety_invariants(self):
         handler = (ROOT / "scripts/templates/combined_refresh_handler.swift").read_text(encoding="utf-8")

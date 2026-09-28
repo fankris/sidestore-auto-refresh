@@ -11,6 +11,29 @@ import subprocess
 
 from audit_ipa_signing import inventory
 
+REQUIRED_SIDESTORE_INTENT_SYMBOLS = (
+    b"9SideStore20RefreshAllAppsIntentV",
+    b"9SideStore26RefreshAllAppsWidgetIntentV",
+)
+REQUIRED_HOST_INTENT_SYMBOLS = (
+    b"16SideStoreSupport20RefreshAllAppsIntentV",
+    b"16SideStoreSupport26RefreshAllAppsWidgetIntentV",
+)
+
+
+def verify_side_store_intent_runtime_symbols(executable):
+    missing = [symbol.decode("ascii") for symbol in REQUIRED_SIDESTORE_INTENT_SYMBOLS
+               if symbol not in executable]
+    if missing:
+        raise ValueError("headless backend is missing host App Intent runtime adapters: " + ", ".join(missing))
+
+
+def verify_host_intent_runtime_symbols(executable):
+    missing = [symbol.decode("ascii") for symbol in REQUIRED_HOST_INTENT_SYMBOLS
+               if symbol not in executable]
+    if missing:
+        raise ValueError("SideStoreSupport is missing metadata-targeted App Intent wrappers: " + ", ".join(missing))
+
 
 def replace_once(text, old, new):
     if text.count(old) != 1:
@@ -25,6 +48,25 @@ def adapt(text):
     text = replace_once(text, 'rm -r .zsign_cache', '# No zsign cache exists in the fresh packaging workspace.')
     text = replace_once(text, 'find payloadlc/Payload -type d -name "_CodeSignature" -exec rm -r {} +',
                         'find Payload -type d -name "_CodeSignature" -prune -exec rm -r {} +')
+    text = replace_once(text,
+        '''# copy intents
+cp ./Payload/LiveContainer.app/Frameworks/SideStoreApp.framework/Intents.intentdefinition ./Payload/LiveContainer.app/
+cp ./Payload/LiveContainer.app/Frameworks/SideStoreApp.framework/ViewApp.intentdefinition ./Payload/LiveContainer.app/
+cp -r ./Payload/LiveContainer.app/Frameworks/SideStoreApp.framework/Metadata.appintents ./Payload/LiveContainer.app/Metadata.appintents
+sed -i '' 's/9SideStore20RefreshAllAppsIntentV/16SideStoreSupport20RefreshAllAppsIntentV/g' ./Payload/LiveContainer.app/Metadata.appintents/extract.actionsdata
+sed -i '' 's/9SideStore26RefreshAllAppsWidgetIntentV/16SideStoreSupport26RefreshAllAppsWidgetIntentV/g' ./Payload/LiveContainer.app/Metadata.appintents/extract.actionsdata
+''',
+        '''# Stage the host App Intents schemas/metadata from the headless service build,
+# then remove these packaging inputs from the embedded backend framework.
+cp ./Payload/LiveContainer.app/Frameworks/SideStoreApp.framework/Intents.intentdefinition ./Payload/LiveContainer.app/
+cp ./Payload/LiveContainer.app/Frameworks/SideStoreApp.framework/ViewApp.intentdefinition ./Payload/LiveContainer.app/
+cp -r ./Payload/LiveContainer.app/Frameworks/SideStoreApp.framework/Metadata.appintents ./Payload/LiveContainer.app/Metadata.appintents
+sed -i '' 's/9SideStore20RefreshAllAppsIntentV/16SideStoreSupport20RefreshAllAppsIntentV/g' ./Payload/LiveContainer.app/Metadata.appintents/extract.actionsdata
+sed -i '' 's/9SideStore26RefreshAllAppsWidgetIntentV/16SideStoreSupport26RefreshAllAppsWidgetIntentV/g' ./Payload/LiveContainer.app/Metadata.appintents/extract.actionsdata
+rm -f ./Payload/LiveContainer.app/Frameworks/SideStoreApp.framework/Intents.intentdefinition
+rm -f ./Payload/LiveContainer.app/Frameworks/SideStoreApp.framework/ViewApp.intentdefinition
+rm -rf ./Payload/LiveContainer.app/Frameworks/SideStoreApp.framework/Metadata.appintents
+''')
     text = replace_once(text, '# package\n',
                         'python3 "$COMBINED_PACKAGER" --prepare-entitlements . Payload/LiveContainer.app\n\n# package\n')
     return 'set -eu\n' + text
@@ -68,6 +110,7 @@ def verify(path, side_product=None):
         executable = archive.read(embedded + '/SideStore')
         assert executable[:4] == b'\xcf\xfa\xed\xfe', 'Expected arm64 Mach-O'
         assert struct.unpack_from('<I', executable, 12)[0] == 6, 'SideStore must be MH_DYLIB'
+        verify_side_store_intent_runtime_symbols(executable)
         assert archive.read(embedded + '/LCAppInfo.plist')
         assert b'liveContainerAutoRefreshVerification' in executable, 'Patched embedded operation missing'
         host_code = archive.read(base + '/Frameworks/LiveContainerSwiftUI.framework/LiveContainerSwiftUI')
@@ -80,6 +123,7 @@ def verify(path, side_product=None):
         assert b'virtual_window_chrome' in host_code, 'Multitasking Return input-layer fix missing'
         bootstrap_code = archive.read(base + '/Frameworks/LiveContainerShared.framework/LiveContainerShared')
         support_code = archive.read(base + '/Frameworks/SideStoreSupport.framework/SideStoreSupport')
+        verify_host_intent_runtime_symbols(support_code)
         assert b'v3Execute:reply:' in support_code, 'XPC command endpoint missing'
         assert b'execute:reply:' in executable, 'SideStore command dispatcher missing'
         assert b'Import Pairing File' in host_code, 'Unified pairing setup missing'
@@ -96,11 +140,15 @@ def verify(path, side_product=None):
         assert b'16SideStoreSupport20RefreshAllAppsIntentV' in metadata
         assert b'9SideStore20RefreshAllAppsIntentV' not in metadata
         assert b'16SideStoreSupport26RefreshAllAppsWidgetIntentV' in metadata
+        assert b'InstallIPAIntent' not in metadata, 'host metadata still exposes SideStore-owned IPA installation'
         if side_product:
             for source in side_product.rglob('*'):
                 if not source.is_file() or 'PlugIns' in source.relative_to(side_product).parts:
                     continue
                 relative = source.relative_to(side_product).as_posix()
+                if relative in {'Intents.intentdefinition', 'ViewApp.intentdefinition'} or \
+                        relative.startswith('Metadata.appintents/'):
+                    continue
                 if relative == 'SideStore' or '_CodeSignature' in relative:
                     continue
                 assert archive.read(embedded + '/' + relative) == source.read_bytes(), relative

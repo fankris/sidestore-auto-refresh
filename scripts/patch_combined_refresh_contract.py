@@ -44,14 +44,23 @@ def _patch_verified(root: Path) -> None:
         'defaults.set(defaults.string(forKey: "liveContainerAutoRefreshExpectedRunID") ?? refreshIdentifier,\n                     forKey: "liveContainerAutoRefreshHostHandoffRunID")')
     text = replace_once(text,
         'defaults.set(["version": 1, "date": Date(),',
-        '// COMBINED_REFRESH_MANIFEST_V2: omissions are not verified success.\n        defaults.set(["version": 2, "date": Date(),\n            "schema": "LiveContainerRefreshManifestV2",\n            "expected_ids": installedApps.map { $0.bundleIdentifier },')
+        '// COMBINED_REFRESH_MANIFEST_V2: bind verification to the apps this engine actually attempted.\n'
+        '        let requestedIDs = installedApps.map { $0.bundleIdentifier }\n'
+        '        let requestedSet = Set(requestedIDs)\n'
+        '        let expectedIDs = attemptedAppIDs.filter { requestedSet.contains($0) }\n'
+        '        let expectedSet = Set(expectedIDs)\n'
+        '        let skippedIDs = requestedIDs.filter { !expectedSet.contains($0) }\n'
+        '        defaults.set(["version": 2, "date": Date(),\n'
+        '            "schema": "LiveContainerRefreshManifestV2",\n'
+        '            "expected_ids": expectedIDs, "requested_ids": requestedIDs, "skipped_ids": skippedIDs,')
     # The existing helper is itself a raw Python string; its diagnostic Swift
     # must interpolate values rather than print backslash-parenthesis literally.
     start = text.index("    private func automaticRefreshDefaults()")
     end = text.index("    private func startListeningForRunningApps()", start)
     section = text[start:end].replace(r"\\(", r"\(")
     section = replace_once(section, '                let nsError = error as NSError', '''                let runID = defaults.string(forKey: "liveContainerAutoRefreshExpectedRunID") ?? refreshIdentifier
-                let failure = CombinedFailure.capture(error, operation: "refresh", stage: .refreshVerification, id: runID)''')
+                let failure = CombinedFailure.capture(V3HeadlessPairingFailure.tagIfInvalidPairing(error),
+                    operation: "refresh", stage: .refreshVerification, id: runID)''')
     section = replace_once(section,
         r'debugLog("[AUTO_REFRESH] REFRESH_FAILED bundle_id=\(bundleIdentifier) stage=refresh error_code=\(nsError.code) error_domain=\(nsError.domain) error=\(error.localizedDescription)")',
         r'debugLog("[AUTO_REFRESH] REFRESH_FAILED \(failure.technicalDetails)")')
@@ -93,8 +102,9 @@ def patch_combined_cli(root: Path) -> None:
 
 
 def verify(text: str) -> None:
-    for needle in (MARKER, '"expected_ids": installedApps.map',
+    for needle in (MARKER, '"expected_ids": expectedIDs, "requested_ids": requestedIDs, "skipped_ids": skippedIDs',
                    'defaults.string(forKey: "liveContainerAutoRefreshExpectedRunID") ?? refreshIdentifier',
+                   'CombinedFailure.capture(V3HeadlessPairingFailure.tagIfInvalidPairing(error)',
                    '"failure": failure.wire', 'REFRESH_FAILED \\(failure.technicalDetails)'):
         if needle not in text:
             raise SystemExit(f"combined refresh contract missing {needle}")

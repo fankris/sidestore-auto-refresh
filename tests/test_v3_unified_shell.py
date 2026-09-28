@@ -24,12 +24,35 @@ def fixture(root: Path) -> Tuple[Path, Path]:
     (live / "LiveContainerSwiftUI/Utilities/Shared.swift").write_text("public enum LCTabIdentifier: Hashable {\n    case sources\n    case apps\n    case tweaks\n    case settings\n}\n\npublic struct SharedModel {\n    @Published var selectedTab: LCTabIdentifier = .apps\n}\n")
     (live / "LiveContainerSwiftUI/App/LiveContainerSwiftUIApp.swift").write_text("struct Root {\n            LCTabView()\n}\n")
     (live / "LiveContainerSwiftUI/Views/Settings/LCSettingsView.swift").write_text('''struct Settings {
+    @State private var certificateDataFound = false
+    var body: some View {
+        NavigationView {
+            Form {
+                if sharedModel.multiLCStatus != 2 {
+                }
+            }
+            .navigationBarTitle("lc.tabView.settings".loc)
+        }
+    }
                 if store == .SideStore {
                     Section {
                         NavigationLink { LCEmbeddedSideStoreRefreshView() } label: { Text("SideStore scheduled refresh") }
                     }
                 }
 }
+
+    func onSideStoreCertificateCallback(certificateData: Data, password: String) {
+        certificateDataFound = true
+    }
+
+    func removeCertificate() async {
+    }
+
+    func handleURL(url: URL) {
+        if url.host == "certificate" {
+            return
+        }
+    }
 
 struct LCTweaksView: View {
     var body: some View { Text("tweaks") }
@@ -129,11 +152,16 @@ class V3UnifiedShellTests(unittest.TestCase):
         runtime = (ROOT / "scripts/templates/v3_headless_runtime.swift").read_text(encoding="utf-8")
         service = (ROOT / "scripts/templates/v3_sidestore_service.swift").read_text(encoding="utf-8")
         integration = (ROOT / "scripts/patch_v3_service.py").read_text(encoding="utf-8")
-        self.assertIn('Button("Install / Sideload App")', source)
+        self.assertIn('Button("Install with SideStore", systemImage: "arrow.down.app")', source)
         self.assertIn('UIDocumentPickerViewController(forOpeningContentTypes:', source)
         self.assertIn('func documentPickerWasCancelled', source)
-        self.assertIn('status.stageSharedIPA(url, title: "Install / Sideload App")', source)
-        self.assertIn('perform("installSharedIPA", target: token', source)
+        self.assertIn('status?.stagePickerIPA(url, attemptID: attemptID)', source)
+        self.assertIn('status.stageSharedIPA(selected, bookmark: bookmark, title: "Install shared app")', source)
+        self.assertIn("V3IPAStaging.stage(sourceURL: url", source)
+        self.assertNotIn('"V3SharedIPA."', source)
+        self.assertIn("V3InstallPipelineParity.makeOperation(route: route, app)", runtime)
+        self.assertIn("AppOperation.install($0)", runtime)
+        self.assertIn("installAttempt.staged(attemptID: attemptID", source)
         self.assertIn('"opStart"', source)
         self.assertIn('"kind": request.operation', source)
         self.assertIn('case "opStart"', service)
@@ -169,9 +197,12 @@ class V3UnifiedShellTests(unittest.TestCase):
         source = (ROOT / "tests/fixtures/issue25_v3_rendering_harness.swift").read_text(encoding="utf-8")
         screen = source.split("struct V3RenderingScreen: View {", 1)[1].split("@MainActor final class V3RenderingRunner", 1)[0]
         self.assertIn('V3InstalledAppsSection(query: state.query)\n'
-                      '                        .background(FixtureGeometryProbe(id: "content"))\n'
-                      '                        .background(FixtureScrollMarker(state: state))\n'
-                      '                        .coordinateSpace(name: "v3-content")', screen)
+                      '                            .background(FixtureGeometryProbe(id: "content"))\n'
+                      '                            .background(FixtureScrollMarker(state: state))', screen)
+        self.assertIn('.coordinateSpace(name: "v3-content")', screen)
+        self.assertIn('V3HomeServiceHeader(isConnected: true', screen)
+        self.assertIn('"reload-status-phone-width-320"', source)
+        self.assertIn('"reload-status-tablet-width-1024"', source)
         self.assertIn('}\n                .background(FixtureGeometryProbe(id: "viewport"))\n'
                       '                .coordinateSpace(name: "v3-viewport")', screen)
         for modifier in (".frame(", ".padding(", ".offset(", ".scaleEffect(", ".ignoresSafeArea("):
@@ -276,7 +307,8 @@ precondition(near(scrolledSection, CGRect(x: 0, y: -262, width: 390, height: 325
                       "V3LogsView", "V3ExperimentalView", "V3SettingsStore",
                       "V3OperationSheet", "signInPresented", "V3SignInLink",
                       "needsSignIn", "Begin Sign In", "V3RefreshDetailView",
-                      "NRG-Wardog", "Step 1 -", "Submit Code"):
+                      "NRG-Wardog", "Choose how Apple sends", "Verify Code",
+                      "Change Verification Method", "Requesting a verification"):
             self.assertIn(token, source)
         for gone in ("Quick Actions",
                      ".sheet(isPresented: $status.refreshPresented"):
@@ -310,7 +342,7 @@ class V3SetupAssistantTests(unittest.TestCase):
 
     def test_setup_entry_points(self):
         source = (ROOT / "scripts/templates/v3_unified_shell.swift").read_text(encoding="utf-8")
-        self.assertIn(".sheet(isPresented: $status.setupPresented)", source)
+        self.assertIn(".sheet(isPresented: $status.setupPresented, onDismiss: { routePendingCanonicalJITLessSetup() })", source)
         self.assertIn("V3SetupAssistantView", source)
         self.assertIn("routePendingSetup()", source)
         self.assertIn('"V3PendingSetupAssistant"', source)
@@ -339,7 +371,9 @@ class V3SetupAssistantTests(unittest.TestCase):
 
     def test_verified_refresh_semantics(self):
         source = (ROOT / "scripts/templates/v3_unified_shell.swift").read_text(encoding="utf-8")
-        self.assertIn("runID != baselineRunID", source)
+        self.assertIn("testRequestID", source)
+        self.assertIn("V3RefreshAllAttemptState.record(in: ledger, requestID: requestID)", source)
+        self.assertIn('runRecord["state"]', source)
         self.assertIn("allSatisfy", source)
         self.assertIn("Task.checkCancellation", source)
         self.assertIn("Copy Setup Diagnostics", source)
@@ -363,23 +397,105 @@ class V3SetupAssistantTests(unittest.TestCase):
 
 
 class V3SetupAcceptanceTests(unittest.TestCase):
-    def test_setup_complete_requires_everything(self):
+    def test_known_missing_pairing_does_not_offer_test_refresh(self):
         source = (ROOT / "scripts/templates/v3_unified_shell.swift").read_text(encoding="utf-8")
-        block = source[source.index("var isComplete: Bool"):source.index("var isComplete: Bool") + 800]
-        for required in ('pairing.state == "complete"', 'account.state == "complete"',
-                         'network.state == "complete"', 'tunnel.state == "complete"',
-                         'background.state == "complete"', 'schedule.state == "complete"',
-                         'verification.state == "complete"'):
-            self.assertIn(required, block)
+        assistant = source.index("struct V3SetupAssistantView")
+        start = source.index('Section("Verification")', assistant)
+        verification = source[start:source.index("// V3_SETUP_COMPLETION_POLICY", start)]
+        self.assertIn("Complete Pairing Setup before testing refresh.", verification)
+        self.assertIn('setup.verification.state != "complete" && setup.pairing.state == "actionRequired"',
+                      verification)
+
+    def test_setup_complete_requires_everything(self):
+        # V3_SETUP_COMPLETION_POLICY_V1: the assistant no longer owns a private
+        # rule. It supplies inputs to the one shared policy that Home also uses.
+        source = (ROOT / "scripts/templates/v3_unified_shell.swift").read_text(encoding="utf-8")
+        setup = source[source.index("final class V3SetupStore"):source.index("struct V3SetupAssistantView")]
+        self.assertIn("func completionInputs(status: V3SideStoreStatusStore) -> V3SetupCompletionInputs {", setup)
+        for required in ('accountComplete: account.state == "complete"',
+                         'provisioningIncomplete: statusProvisioningIncomplete',
+                         'pairingSatisfied: pairing.state == "complete"',
+                         'V3JITLessCompletionPolicy.isRequired(',
+                         'jitlessComplete: V3JITLessCompletionPolicy.isComplete(status.jitlessReadiness)',
+                         'networkComplete: network.state == "complete"',
+                         'tunnelComplete: tunnel.state == "complete"',
+                         'backgroundRefreshAvailable: background.state == "complete"',
+                         'scheduleEnabled: schedule.state == "complete"',
+                         'verifiedRefreshPresent: verification.state == "complete"'):
+            self.assertIn(required, setup)
+        # Neither surface may restate the platform requirement locally, which is
+        # what let Home and the assistant disagree on iOS 26.
+        self.assertNotIn("jitlessRequired: ProcessInfo.processInfo", setup)
+        # The decision itself is delegated, never re-implemented.
+        self.assertIn("func isComplete(status: V3SideStoreStatusStore) -> Bool", setup)
+        self.assertNotIn('majorVersion < 26 || jitless.state == "complete"', setup)
+
+    def test_generated_shell_has_no_collapsed_declarations(self):
+        # A closing brace immediately followed by a declaration on the same line
+        # is a syntax error that no source-text assertion would catch, and it is
+        # easy to introduce with a scripted edit. The generated shell is checked
+        # structurally, statement by statement.
+        primitives = (ROOT / "scripts/templates/v3_behavioral_primitives.swift").read_text(encoding="utf-8")
+        staging = (ROOT / "scripts/templates/v3_ipa_staging.swift").read_text(encoding="utf-8")
+        template = (ROOT / "scripts/templates/v3_unified_shell.swift").read_text(encoding="utf-8")
+        generated = primitives.splitlines() + [""] + staging.splitlines() + [""] + template.splitlines()
+        pattern = re.compile(r"\}\s+(?:@Published|@State|@Environment|@FocusState|@AppStorage|"
+                             r"@EnvironmentObject|private |public |internal |static |func |var |let |"
+                             r"struct |enum |init)")
+        offenders = [(index, line) for index, line in enumerate(generated, 1) if pattern.search(line)]
+        self.assertEqual(offenders, [],
+                         "a declaration was collapsed onto a closing brace: "
+                         + "\n".join(f"{index}: {line}" for index, line in offenders))
+
+    def test_generated_shell_balances_braces(self):
+        # Every template is concatenated into a single generated Swift file, so a
+        # single unbalanced brace anywhere makes the whole product unparseable.
+        # String literals are stripped BEFORE comments, because a "//" inside a
+        # literal (a URL, for example) would otherwise be read as a comment and
+        # silently remove the rest of the line.
+        for path in sorted((ROOT / "scripts/templates").glob("*.swift")):
+            text = path.read_text(encoding="utf-8")
+            body = re.sub(r'"(?:[^"\\\n]|\\.)*"', '""', text)
+            body = re.sub(r"//[^\n]*", "", body)
+            self.assertEqual(body.count("{"), body.count("}"),
+                             f"{path.name} has unbalanced braces, so the generated file cannot parse")
 
     def test_history_never_satisfies_current_test(self):
         source = (ROOT / "scripts/templates/v3_unified_shell.swift").read_text(encoding="utf-8")
         self.assertEqual(source.count('detail: "Refresh verified"'), 1)
-        check = source[source.index("private func checkTestResult"):
-                      source.index("private func checkTestResult") + 3000]
+        check_start = source.index("private func checkTestResult")
+        check = source[check_start:source.index("func cancelTest()", check_start)]
         self.assertIn('detail: "Refresh verified"', check)
-        self.assertIn("runID != baselineRunID", check)
+        self.assertIn("testRequestID", check)
+        self.assertIn("V3RefreshAllAttemptState.record(in: ledger, requestID: requestID)", check)
+        self.assertIn('runState == "completed" || runState == "failed"', check)
         self.assertIn("hasCompleteTerminalResults", check)
+        self.assertIn("V3RefreshAllTerminalEvidencePolicy.verifiedSummary", check)
+        self.assertIn('runRecord["terminal_at"] as? TimeInterval', check)
+
+    def test_cancelled_setup_test_task_cannot_write_into_next_attempt(self):
+        source = (ROOT / "scripts/templates/v3_unified_shell.swift").read_text(encoding="utf-8")
+        setup = source[source.index("final class V3SetupStore"):source.index("struct V3SetupAssistantView")]
+        self.assertIn("private var testAttemptID: String?", setup)
+        self.assertIn("testAttemptID = nil", setup[setup.index("func cancelTest() {"):])
+        self.assertIn("checkTestResult(attemptID: attemptID)", setup)
+        self.assertIn("V3SetupTestAttemptPolicy.mayApply", setup)
+        self.assertIn("catch is CancellationError", setup)
+
+    def test_cancelled_setup_watcher_resumes_same_scheduler_request(self):
+        source = (ROOT / "scripts/templates/v3_unified_shell.swift").read_text(encoding="utf-8")
+        setup = source[source.index("final class V3SetupStore"):source.index("struct V3SetupAssistantView")]
+        start = setup[setup.index("func runTestRefresh(status: V3SideStoreStatusStore) {"):
+                      setup.index("private func startTestMonitor")]
+        cancel = setup[setup.index("func cancelTest() {"):]
+        self.assertIn("case .resumeExisting(let existingRequestID)", start)
+        self.assertIn("shouldPostRequest = false", start)
+        self.assertIn("if shouldPostRequest", start)
+        self.assertIn("The current refresh continues in the background", cancel)
+        self.assertNotIn("removeObject(forKey: Self.pendingTestRequestIDKey)", cancel)
+        assistant = source[source.index("struct V3SetupAssistantView"):source.index("private struct V3HomeView")]
+        self.assertIn(".onDisappear {", assistant)
+        self.assertIn("if setup.testRunning { setup.cancelTest() }", assistant)
 
     def test_partial_manifest_does_not_verify(self):
         compiler = shutil.which("swiftc")
@@ -406,11 +522,23 @@ class V3SetupAcceptanceTests(unittest.TestCase):
         self.assertIn("V3RefreshDetailView()", source)
 
     def test_home_banner_reflects_full_setup(self):
+        # V3_SETUP_COMPLETION_POLICY_V1: Home and the assistant now consume the
+        # same policy, so the banner can no longer stop while the assistant
+        # still considers setup incomplete.
         source = (ROOT / "scripts/templates/v3_unified_shell.swift").read_text(encoding="utf-8")
-        self.assertIn("setupIncomplete", source)
-        self.assertIn("liveContainerAutoRefreshEnabled", source)
-        self.assertIn("backgroundRefreshStatus != .available", source)
-        self.assertIn("liveContainerAutoRefreshVerification", source)
+        home = source[source.index("struct V3HomeServiceHeader"):]
+        self.assertIn("completionInputs(status: status, defaults: defaults).isComplete", home)
+        for required in ("accountComplete: !status.needsSignIn",
+                         "provisioningIncomplete: status.provisioningIncomplete",
+                         "pairingSatisfied: !V3RefreshPrerequisite.evaluate",
+                         "networkComplete: status.wifiAvailable == true",
+                         "tunnelComplete: LiveContainerNetworkPreflight.hasTunnelInterface()",
+                         "backgroundRefreshAvailable: UIApplication.shared.backgroundRefreshStatus == .available",
+                         "scheduleEnabled: defaults?.bool(forKey: \"liveContainerAutoRefreshEnabled\")",
+                         "verifiedRefreshPresent: verifiedRunID?.isEmpty == false"):
+            self.assertIn(required, home)
+        # The old private rule must be gone.
+        self.assertNotIn('if UIApplication.shared.backgroundRefreshStatus != .available { return true }', home)
 
     def test_tunnel_presence_never_proves_coredevice(self):
         source = (ROOT / "scripts/templates/v3_unified_shell.swift").read_text(encoding="utf-8")
@@ -420,12 +548,81 @@ class V3SetupAcceptanceTests(unittest.TestCase):
         self.assertIn('verification.state == "complete"', coredevice)
 
     def test_generic_errors_keep_structure(self):
+        # V3_FAILURE_GUIDANCE_V1: this test previously asserted the opposite of
+        # the policy. It required the row caption to carry failure.technicalDetails
+        # and the bridged NSError domain and code, which is a diagnostics line
+        # rendered as product copy. It also pinned an `else if let native = error
+        # as NSError?` arm that made the final `else` unreachable, because every
+        # Swift Error bridges to NSError?.
         source = (ROOT / "scripts/templates/v3_unified_shell.swift").read_text(encoding="utf-8")
         start = source.index("func recordError")
-        record = source[start:start + 1500]
-        self.assertIn("failure.technicalDetails", record)
-        self.assertIn("native.domain", record)
-        self.assertIn("native.code", record)
+        record = source[start:source.index("\n    }\n", start)]
+        record = "\n".join(line for line in record.splitlines()
+                           if not line.strip().startswith("//"))
+        # A typed failure keeps its own product copy and its structured fields.
+        self.assertIn("failure.safeMessage", record)
+        self.assertIn("failure.recovery", record)
+        self.assertIn("recordFailure(operation: operation, stage: failure.stage.rawValue", record)
+        # An untyped failure invents nothing and shows no numeric code.
+        self.assertNotIn("native.domain", record)
+        self.assertNotIn("native.code", record)
+        self.assertNotIn("localizedDescription", record)
+        self.assertIn("cause is not known", record)
+        self.assertIn("V3FailureGuidance.message(error)", record)
+        # The unreachable arm is gone: there is one typed branch and one else.
+        self.assertNotIn("as NSError?", record)
+        self.assertEqual(record.count("recordFailure(operation: operation"), 2)
+
+    def test_refresh_warning_copy_is_readable_and_diagnostics_stay_in_logs(self):
+        # V3_FAILURE_GUIDANCE_V1: lastErrorKey is rendered as red product copy on
+        # Home under a "Last Refresh Warning" heading. It held a bridged
+        # localizedDescription, which for an NSError is a numeric domain and
+        # code, and opaque snake_case tokens.
+        scheduler = (ROOT / "scripts/templates/livecontainer_refresh_scheduler.swift").read_text(encoding="utf-8")
+        self.assertNotIn("defaults.set(error.localizedDescription, forKey: lastErrorKey)", scheduler)
+        for message in ("hostRelaunchUnverifiedMessage", "hostBaselineUnavailableMessage",
+                        "hostExpirationNotAdvancedMessage", "schedulerConfigurationMessage",
+                        "backgroundSubmitFailedMessage"):
+            self.assertIn(f"static let {message} =", scheduler)
+        # No opaque token may be stored where the user reads it.
+        for token in ('"installed_host_baseline_unavailable"',
+                      '"installed_host_expiration_not_advanced"'):
+            self.assertNotIn(f"defaults.set({token}, forKey: lastErrorKey)", scheduler)
+        # The raw text is still recorded for a support reader.
+        self.assertIn("detail: error.localizedDescription", scheduler)
+        alarm = (ROOT / "scripts/templates/livecontainer_refresh_alarm.swift").read_text(encoding="utf-8")
+        self.assertNotIn('set(error.localizedDescription, forKey: "liveContainerAutoRefreshDeadlineWarningError")', alarm)
+
+    def test_untyped_guidance_does_not_claim_a_side_effect(self):
+        # Nothing supports "nothing was changed" for an untyped failure: it can
+        # arrive after the service applied the request, and the same helper runs
+        # after settings writes, source confirmation, pairing import and staging.
+        primitives_text = (ROOT / "scripts/templates/v3_behavioral_primitives.swift").read_text(encoding="utf-8")
+        start = primitives_text.index("enum V3FailureGuidance")
+        guidance = primitives_text[start:primitives_text.index("\n}", start)]
+        # Comments are stripped so the prose describing the old wording is never
+        # read as the wording itself.
+        code = "\n".join(line for line in guidance.splitlines()
+                         if not line.strip().startswith("//"))
+        self.assertNotIn("nothing was changed", code)
+        self.assertIn("whether it took effect is not known", code)
+        # A typed failure still keeps its own recovery copy.
+        self.assertIn("return combined.recovery", code)
+
+    def test_manifest_diagnostics_are_not_used_as_a_row_caption(self):
+        # The manifest's "error" field is a newline-joined block of message,
+        # recovery and technical details. It is a diagnostic record, and it was
+        # being rendered verbatim as the Test Refresh row caption.
+        source = (ROOT / "scripts/templates/v3_unified_shell.swift").read_text(encoding="utf-8")
+        start = source.index('var detail = "Refresh reported failures"')
+        block = source[start:source.index("\n        }", start)]
+        self.assertIn("CombinedFailure.decode", block)
+        self.assertIn("detail = decoded.safeMessage", block)
+        self.assertIn("verificationGuidance = decoded.recovery", block)
+        # The full text is no longer the caption; only its first line may be, and
+        # only when the manifest carries no structured failure.
+        self.assertIn("message.split(separator: \"\\n\").first", block)
+        self.assertNotIn("detail = message", block)
 
 
 class V3RefreshFeedbackTests(unittest.TestCase):

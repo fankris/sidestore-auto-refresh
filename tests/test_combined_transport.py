@@ -12,6 +12,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 from patch_combined_transport import POLICY, patch
+from patch_v3_service import PINS as V3_SOURCE_PINS
 from patch_sidestore_integration import patch_gateway
 
 
@@ -22,8 +23,14 @@ def source_root():
         ROOT.parent / "work/EmbeddedSideStore",
     ]
     for candidate in candidates:
-        if (candidate / "Dependencies/minimuxer/DeviceGateway/BaseDeviceGateway.swift").is_file():
+        if not (candidate / "Dependencies/minimuxer/DeviceGateway/BaseDeviceGateway.swift").is_file():
+            continue
+        revision = subprocess.run(["git", "-C", str(candidate), "rev-parse", "HEAD"],
+                                  capture_output=True, text=True)
+        if revision.returncode == 0 and revision.stdout.strip() == V3_SOURCE_PINS[1]:
             return candidate
+        if override:
+            raise AssertionError(f"Embedded SideStore source must be pinned to {V3_SOURCE_PINS[1]}")
     message = "Pinned modern SideStore source unavailable; set EMBEDDED_SIDESTORE_TEST_SOURCE"
     if override:
         raise AssertionError(message + f" (invalid path: {override})")
@@ -223,11 +230,12 @@ class CombinedTransportTests(SourceFixture):
     def test_readiness_and_batch_lease(self):
         patch(self.mux)
         impl = self.read("Sources/MinimuxerImpl.swift")
-        self.assertIn("if #available(iOS 26.4, *)", impl)
+        self.assertIn("if #available(iOS 17.0, *)", impl)
         self.assertIn("gateway.supportsCoreDeviceTransport", impl)
         self.assertIn("if !gateway.hasActiveTransportBatch { return .success(false) }", impl)
         self.assertNotIn("no ipsec interface (required for lockdown", impl.lower())
         runner = (self.side / "SideStore/Core/Operations/PipelineRunner.swift").read_text(encoding="utf-8")
+        self.assertIn("V3HeadlessPairingFailure.tagIfInvalidPairing(error.asOperationError)", runner)
         begin = runner.index("await transportCore.beginTransportBatch()")
         task = runner.index("do {", begin)
         readiness = runner.index("/* Minimuxer Readiness Check */", task)
@@ -458,7 +466,10 @@ class CombinedWorkflowTests(unittest.TestCase):
             self.assertIn(pin, workflow)
         self.assertIn('merge-base --is-ancestor "$SIDESIGN_GSA_FIX" HEAD', workflow)
         self.assertNotRegex(workflow, r"SideSign (?:checkout|cherry-pick)")
-        self.assertIn("SideStore/Core/Auth SideStore/Core/Anisette", workflow)
+        self.assertIn("SideStore/Core/Anisette", workflow)
+        self.assertIn("AltStore/Managing Apps/AppManager.swift", workflow)
+        self.assertIn("--verify-headless-ui-adapters", workflow)
+        self.assertIn("--verify-sign-in-operation", workflow)
         service = (ROOT / "scripts/templates/v3_sidestore_service.swift").read_text()
         runtime = (ROOT / "scripts/templates/v3_headless_runtime.swift").read_text()
         self.assertNotIn("AuthFlowHandler", service + runtime)

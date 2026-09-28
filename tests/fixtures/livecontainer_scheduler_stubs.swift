@@ -31,6 +31,12 @@ class BGTaskScheduler {
     }
     func cancel(taskRequestWithIdentifier identifier: String) {}
 }
+@MainActor class UIApplication {
+    static let shared = UIApplication()
+    static let openSettingsURLString = "app-settings:"
+    var openedURLs: [URL] = []
+    func open(_ url: URL) async -> Bool { openedURLs.append(url); return true }
+}
 enum UNAuthorizationStatus { case notDetermined, denied, authorized, provisional }
 struct UNAuthorizationOptions: OptionSet {
     let rawValue: Int
@@ -38,20 +44,26 @@ struct UNAuthorizationOptions: OptionSet {
 }
 struct UNNotificationSettings { var authorizationStatus: UNAuthorizationStatus = .authorized }
 struct UNNotificationSound { static let `default` = Self() }
-class UNMutableNotificationContent { var title = ""; var body = ""; var sound: UNNotificationSound? }
+class UNMutableNotificationContent { var title = ""; var body = ""; var sound: UNNotificationSound?; var userInfo: [AnyHashable: Any] = [:] }
 class UNTimeIntervalNotificationTrigger { init(timeInterval: TimeInterval, repeats: Bool) {} }
 class UNNotificationRequest {
     let identifier: String; let content: UNMutableNotificationContent
     init(identifier: String, content: UNMutableNotificationContent, trigger: UNTimeIntervalNotificationTrigger?) { self.identifier = identifier; self.content = content }
 }
-class UNUserNotificationCenter {
+@MainActor class UNUserNotificationCenter {
     static let shared = UNUserNotificationCenter()
     static func current() -> UNUserNotificationCenter { shared }
     var requests: [UNNotificationRequest] = []
-    func notificationSettings() async -> UNNotificationSettings { UNNotificationSettings() }
+    var settings = UNNotificationSettings()
+    var onAdd: (@MainActor (UNNotificationRequest) -> Void)?
+    func notificationSettings() async -> UNNotificationSettings { settings }
     func requestAuthorization(options: UNAuthorizationOptions) async throws -> Bool { true }
     func getNotificationSettings(_ completion: (UNNotificationSettings) -> Void) { completion(UNNotificationSettings()) }
-    func add(_ request: UNNotificationRequest, withCompletionHandler completion: ((Error?) -> Void)? = nil) { requests.append(request); completion?(nil) }
+    func add(_ request: UNNotificationRequest, withCompletionHandler completion: ((Error?) -> Void)? = nil) {
+        requests.append(request)
+        onAdd?(request)
+        completion?(nil)
+    }
     func removePendingNotificationRequests(withIdentifiers identifiers: [String]) {}
 }
 class FakeAppInfo { func bundlePath() -> String? { nil }; func bundleIdentifier() -> String { "test.guest" } }
@@ -69,7 +81,7 @@ enum LiveContainerRefreshBridge {
     static var resultRetryable: Bool?
     static var staleFailure = false
     static var malformedFailure = false
-    static func refreshAllApps() async throws {
+    static func refreshAllApps(runID: UUID) async throws {
         calls += 1
         if uncertain {
             LiveContainerAutoRefreshScheduler.defaults.set(UUID().uuidString, forKey: "liveContainerAutoRefreshUncertainMutationRunID")
@@ -82,13 +94,18 @@ enum LiveContainerRefreshBridge {
             var wire = CombinedFailure(operation: "refresh", stage: stage, id: staleFailure ? UUID().uuidString : run,
                 underlying: NSError(domain: "DeviceGatewayError", code: 77), retryable: resultRetryable).wire
             if malformedFailure { wire["stage"] = "SECRET_TOKEN" }
-            defaults.set(["run_id": run, "expected_ids": ["spotify"], "results": [
+            defaults.set(["version": 2, "schema": "LiveContainerRefreshManifestV2",
+                          "run_id": run, "requested_ids": ["spotify"], "expected_ids": ["spotify"],
+                          "skipped_ids": [], "results": [
                 ["bundle_id": "spotify", "success": false, "failure": wire, "error": "SECRET_TOKEN private-server-response"] as [String: Any]]],
                 forKey: "liveContainerAutoRefreshVerification")
             return
         }
-        defaults.set(["run_id": defaults.string(forKey: "liveContainerAutoRefreshExpectedRunID") ?? "",
+        defaults.set(["version": 2, "schema": "LiveContainerRefreshManifestV2",
+                      "run_id": defaults.string(forKey: "liveContainerAutoRefreshExpectedRunID") ?? "",
+                      "requested_ids": incomplete ? ["spotify", "other"] : ["spotify"],
                       "expected_ids": incomplete ? ["spotify", "other"] : ["spotify"],
+                      "skipped_ids": [],
                       "results": [["bundle_id": "spotify", "success": true]]],
                      forKey: "liveContainerAutoRefreshVerification")
     }

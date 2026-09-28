@@ -1,6 +1,25 @@
 import Foundation
 import CoreFoundation
 
+public struct CombinedRefreshTargetPlan: Equatable {
+    public let requestedIDs: [String]
+    public let attemptedIDs: [String]
+    public let skippedIDs: [String]
+}
+
+public enum CombinedRefreshTargetPolicy {
+    public static func plan(requestedIDs: [String], runningIDs: Set<String>,
+                            isCorrelatedManualRun: Bool) -> CombinedRefreshTargetPlan {
+        let attempted = isCorrelatedManualRun
+            ? requestedIDs
+            : requestedIDs.filter { !runningIDs.contains($0) }
+        let attemptedSet = Set(attempted)
+        return CombinedRefreshTargetPlan(requestedIDs: requestedIDs,
+            attemptedIDs: attempted,
+            skippedIDs: requestedIDs.filter { !attemptedSet.contains($0) })
+    }
+}
+
 // LC_REFRESH_METADATA_SANITIZED_V1: never forward arbitrary saved result dictionaries.
 public enum CombinedVerification {
     static let uncertainMutationKey = "liveContainerAutoRefreshUncertainMutationRunID"
@@ -17,6 +36,7 @@ public enum CombinedVerification {
               manifest["version"] as? Int == 2, manifest["schema"] as? String == "LiveContainerRefreshManifestV2",
               let expected = manifest["expected_ids"] as? [String], !expected.isEmpty, expected.count <= 1024,
               expected.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 512 }), Set(expected).count == expected.count,
+              targetCoverageIsValid(manifest, expected: expected),
               let entries = manifest["results"] as? [[String: Any]], entries.count == expected.count else { return false }
         var received = Set<String>()
         for entry in entries {
@@ -26,13 +46,28 @@ public enum CombinedVerification {
         }
         return received == Set(expected)
     }
+    private static func targetCoverageIsValid(_ manifest: [String: Any], expected: [String]) -> Bool {
+        guard manifest["requested_ids"] != nil || manifest["skipped_ids"] != nil else { return true }
+        guard let requested = manifest["requested_ids"] as? [String],
+              let skipped = manifest["skipped_ids"] as? [String],
+              !requested.isEmpty, requested.count <= 1024, skipped.count <= 1024,
+              requested.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 512 }),
+              skipped.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 512 }),
+              Set(requested).count == requested.count, Set(skipped).count == skipped.count else { return false }
+        let expectedSet = Set(expected), skippedSet = Set(skipped)
+        return expectedSet.isDisjoint(with: skippedSet) &&
+            expectedSet.union(skippedSet) == Set(requested)
+    }
     static func sanitized(_ payload: [String: Any], runID: String) -> [String: Any] {
         guard let manifest = payload["liveContainerAutoRefreshVerification"] as? [String: Any],
               manifest["run_id"] as? String == runID,
               let expected = manifest["expected_ids"] as? [String], expected.count <= 1024,
               expected.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 512 }),
+              targetCoverageIsValid(manifest, expected: expected),
               let entries = manifest["results"] as? [[String: Any]], entries.count <= 1024 else { return [:] }
         var result: [String: Any] = ["version": 2, "schema": "LiveContainerRefreshManifestV2", "run_id": runID, "expected_ids": expected]
+        if let requested = manifest["requested_ids"] as? [String] { result["requested_ids"] = requested }
+        if let skipped = manifest["skipped_ids"] as? [String] { result["skipped_ids"] = skipped }
         if let date = manifest["date"] as? Date { result["date"] = date }
         if let handoff = manifest["host_handoff"] as? Bool { result["host_handoff"] = handoff }
         result["results"] = entries.compactMap { entry -> [String: Any]? in
@@ -66,14 +101,120 @@ public enum CombinedVerification {
 
 // LC_STRUCTURED_FAILURE_V1: fixed vocabulary, no arbitrary userInfo/descriptions on the wire.
 public struct CombinedFailure: Error, LocalizedError {
+    public enum SafeCause: String, CaseIterable {
+        case networkConnectionLost
+        case networkTimedOut
+        case networkUnavailable
+        case signingNetworkConnectionLost
+        case signingNetworkTimedOut
+        case signingNetworkUnavailable
+        case developerPortalRejectedRequest
+        case developerPortalInvalidResponse
+        case provisioningProfileUnavailable
+        case certificateUnavailable
+        case wifiUnavailable
+        case localDevVPNUnavailable
+        case unknownSigningCause
+        case sourceNetworkFailure
+        case sourceInvalidManifest
+        case sourcePersistenceUnverified
+        case sourceInvalidURL
+        case sourceRemoveFailed
+        case sourceRemoveBusy
+        case sourceAddBusy
+        case operationInProgress
+        case responseCapacityUnavailable
+        case staleRefreshAttempt
+        case knownSourcePolicyNetworkFailure
+        case knownSourcePolicyInvalidResponse
+        case catalogUnavailable
+        case catalogSourceUnavailable
+        // V3_RESPONSE_ENCODING_CLASSIFICATION_V1: the service built a reply it
+        // could not serialize. Distinct from an oversized reply.
+        case responseEncodingFailed
+        // V3_RESPONSE_ENCODING_CLASSIFICATION_V1: the reply serialized cleanly
+        // but exceeded the transport limit. This is a third defect, distinct
+        // from both an encoding failure and a reply that could not be parsed,
+        // and it must not be reported as any of them.
+        case responseTooLarge
+        case pairingRequired
+        case invalidPairingFile
+        case authAttemptNotDispatched
+        case authProvisioningRetryNotDispatched
+        case authSessionUnavailable
+        case authResponseCapacityUnavailable
+
+        fileprivate var inferredRetryable: Bool? {
+            switch self {
+            case .networkConnectionLost, .networkTimedOut, .networkUnavailable,
+                 .signingNetworkConnectionLost, .signingNetworkTimedOut, .signingNetworkUnavailable,
+                 .wifiUnavailable, .localDevVPNUnavailable:
+                return true
+            case .provisioningProfileUnavailable, .certificateUnavailable:
+                return false
+            case .developerPortalRejectedRequest, .developerPortalInvalidResponse:
+                return nil
+            case .unknownSigningCause:
+                return nil
+            case .sourceNetworkFailure:
+                return true
+            case .sourceInvalidManifest, .sourcePersistenceUnverified, .sourceInvalidURL,
+                 .sourceRemoveFailed, .catalogUnavailable:
+                return false
+            case .sourceRemoveBusy, .sourceAddBusy:
+                return true
+            case .operationInProgress, .knownSourcePolicyNetworkFailure:
+                return true
+            case .responseCapacityUnavailable:
+                return true
+            case .staleRefreshAttempt:
+                return false
+            case .knownSourcePolicyInvalidResponse:
+                return nil
+            // The source is gone, so retrying the same request cannot succeed;
+            // the recovery is to reload the source list, not to retry.
+            case .catalogSourceUnavailable:
+                return false
+            // A reply that could not be serialized is not fixed by retrying the
+            // same request; it needs a code fix or a smaller payload.
+            case .responseEncodingFailed:
+                return false
+            // An oversized reply is not fixed by retrying the same request
+            // either: the same data would serialize to the same size again.
+            case .responseTooLarge:
+                return false
+            case .pairingRequired:
+                return false
+            case .invalidPairingFile:
+                return false
+            case .authAttemptNotDispatched:
+                return true
+            case .authProvisioningRetryNotDispatched:
+                return true
+            case .authSessionUnavailable:
+                return false
+            case .authResponseCapacityUnavailable:
+                return true
+            }
+        }
+    }
+
+    public enum SourceStep: String, CaseIterable {
+        case provisioningProfileFetch, certificateValidation, localCodeSigning
+        case sourceDownload, manifestParsing, knownSourcePolicyFetch, knownSourcePolicyParsing, catalogRead
+    }
+
     public enum Stage: String, CaseIterable {
         case hostContainer, storagePreparation, bookmarkCreation, extensionDiscovery, extensionLaunch
-        case xpcConnection, serviceReadiness, command, authentication, signing, installation, refreshVerification
+        case xpcConnection, serviceReadiness, command, authentication, provisioning, signing, filePreparation, installation, refreshVerification
+        case replyEncoding
         case endpointSelection, heartbeat, coreDevice, cdTunnel, rsdDiscovery, rsdService, lockdownConnection, uniqueDeviceID, pairing
+        case network, source, catalog
     }
     public enum Code: String, CaseIterable {
         case unavailable, invalidConfiguration, permissionDenied, timedOut, cancelled, interrupted
         case notReady, busy, invalidResponse, unsupported, failed, missingResult, staleResult
+        case invalidToken, missingFile, emptyFile, invalidPackage, fileAccess, stagingFailed
     }
     public let operation: String
     public let stage: Stage
@@ -81,12 +222,22 @@ public struct CombinedFailure: Error, LocalizedError {
     public let correlationID: String
     public let underlyingDomain: String
     public let underlyingCode: Int
+    public let safeCause: SafeCause?
+    public let sourceStep: SourceStep?
     public let retryable: Bool?
+    // V3_CATALOG_OPERATION_CONTEXT_V1: host-only request context. It records
+    // which request was waiting when a failure occurred before the service
+    // received it, so a catalog read keeps its operation context even when the
+    // failure is a connection problem. It is appended to the copied technical
+    // line only and is never part of the wire envelope.
+    public var requestContext: String?
     public init(operation: String, stage: Stage, code: Code = .failed, id: String,
-                underlying: Error? = nil, retryable: Bool? = nil) {
-        let normalized = ["snapshot": "status", "refreshApp": "refresh", "installURL": "install", "installSharedIPA": "install",
+                underlying: Error? = nil, retryable: Bool? = nil, safeCause: SafeCause? = nil,
+                sourceStep: SourceStep? = nil) {
+        let normalized = ["snapshot": "status", "refreshApp": "refresh", "refreshAdmissionBegin": "refresh", "refreshAdmissionEnd": "refresh", "installURL": "install", "installSharedIPA": "install",
                           "addSource": "source", "removeSource": "source", "refreshSources": "source", "syncAppIDs": "signIn",
                           "authBegin": "signIn", "authPoll": "signIn", "authRespond": "signIn", "authCancel": "signIn",
+                          "authRetryProvisioning": "signIn",
                           "opStart": "command", "opPoll": "command", "opAnswer": "command", "opCancel": "command",
                           "sourcePreview": "source", "sourceAddConfirmed": "source", "sourceRemoveConfirmed": "source"][operation] ?? operation
         self.operation = Self.operations.contains(normalized) ? normalized : "command"
@@ -96,13 +247,70 @@ public struct CombinedFailure: Error, LocalizedError {
         let domain = error?.domain ?? "none"
         underlyingDomain = Self.domains.contains(domain) ? domain : "redacted"
         underlyingCode = error?.code ?? 0
-        self.retryable = retryable
+        let inferredSourceAddBusy = operation == "sourceAddConfirmed" && code == .busy
+            ? SafeCause.sourceAddBusy : nil
+        self.safeCause = safeCause ?? inferredSourceAddBusy
+        self.sourceStep = sourceStep
+        self.retryable = retryable ?? self.safeCause?.inferredRetryable
     }
-    private static let operations: Set<String> = ["connect", "status", "command", "refresh", "install", "update", "signIn", "signOut", "catalog", "source", "sign", "activate", "deactivate", "delete", "remove", "backup", "restore", "jit"]
-    private static let domains: Set<String> = ["none", "NSCocoaErrorDomain", "NSPOSIXErrorDomain", "NSURLErrorDomain", "NSOSStatusErrorDomain", "ALTServerErrorDomain", "ALTAppleAPIErrorDomain", "ALTErrorDomain", "MinimuxerError", "DeviceGatewayError", "IdeviceGatewayError"]
+    private static let operations: Set<String> = ["connect", "status", "command", "refresh", "install", "update", "signIn", "signOut", "catalog", "source", "sign", "activate", "deactivate", "delete", "remove", "backup", "restore", "jit", "pairingImportData"]
+    private static let domains: Set<String> = ["none", "NSCocoaErrorDomain", "NSPOSIXErrorDomain", "NSURLErrorDomain", "NSOSStatusErrorDomain", "ALTServerErrorDomain", "ALTAppleAPIErrorDomain", "ALTErrorDomain", "MinimuxerError", "DeviceGatewayError", "IdeviceGatewayError", "InstallationProxyErrorDomain", "com.apple.installd", "com.apple.mobile.installation_proxy", "V3IPAFileErrorDomain", "Foundation", "CoreData", "CoreFoundation", "IOKit", "Security", "CFNetwork", "HTTPStatus", "io.sidestore.SideStore.DecodingError"]
+    private static let verificationDomains: Set<String> = ["ALTServerErrorDomain", "ALTErrorDomain", "IdeviceGatewayError", "DeviceGatewayError", "InstallationProxyErrorDomain", "com.apple.installd", "com.apple.mobile.installation_proxy"]
     public var message: String {
+        if operation == "delete", code == .timedOut {
+            return "SideStore could not confirm that the deleted app disappeared from its installed library."
+        }
+        // V3_CATALOG_FAILURE_VOCABULARY_V1: a catalog read must never surface as
+        // the generic command-stage message. It can fail at a stage that is not
+        // the catalog stage, so the operation selects this wording first.
+        //
+        // V3_RESPONSE_CLASSIFICATION_CARRIER_V1: the two reply-level causes are
+        // the exception. They describe the reply itself rather than the catalog,
+        // and the catalog vocabulary covered both of them with one sentence, so
+        // a reply that could not be encoded and a reply that was too large read
+        // identically to a user. The specific cause outranks it.
+        if operation == "catalog", safeCause != .responseEncodingFailed,
+           safeCause != .responseTooLarge, let catalog = catalogFailureMessage { return catalog }
         if code == .cancelled { return "The \(operation) request was cancelled. Its result may need reconciliation." }
         if code == .timedOut { return "The \(operation) request timed out during \(stage.rawValue)." }
+        if let safeCause {            switch safeCause {
+            case .networkConnectionLost: return "The network connection was lost during \(operation)."
+            case .networkTimedOut: return "The network request timed out during \(operation)."
+            case .networkUnavailable: return "A network connection was unavailable during \(operation)."
+            case .signingNetworkConnectionLost: return "The connection to the provisioning service was interrupted during signing."
+            case .signingNetworkTimedOut: return "The provisioning service did not respond during signing."
+            case .signingNetworkUnavailable: return "The signing flow could not reach the provisioning service."
+            case .developerPortalRejectedRequest: return "Apple's Developer Portal rejected a provisioning request during signing."
+            case .developerPortalInvalidResponse: return "The provisioning service returned an invalid response during signing."
+            case .provisioningProfileUnavailable: return "A required provisioning profile is not available for this app."
+            case .certificateUnavailable: return "The selected signing certificate is not available."
+            case .wifiUnavailable: return "Wi-Fi was unavailable before refresh started."
+            case .localDevVPNUnavailable: return "LocalDevVPN was unavailable before refresh started."
+            case .unknownSigningCause: return "SideStore could not sign the selected app. The exact underlying cause could not be safely identified."
+            case .sourceNetworkFailure: return "The source could not be downloaded because its network request failed."
+            case .sourceInvalidManifest: return "The source returned data SideStore could not read as a valid source."
+            case .sourcePersistenceUnverified: return "SideStore could not confirm that the source was saved."
+            case .sourceInvalidURL: return "The source URL is invalid."
+            case .sourceRemoveFailed: return "SideStore could not confirm that the source was removed from its saved list."
+            case .sourceRemoveBusy: return "SideStore was busy with another request, so it did not start removing this source."
+            case .sourceAddBusy: return "SideStore was busy with another request, so it did not confirm adding this source."
+            case .operationInProgress: return "Another SideStore operation is still active."
+            case .responseCapacityUnavailable: return "SideStore cannot safely accept another state-changing request yet."
+            case .staleRefreshAttempt: return "This refresh request belonged to an expired scheduler run and was not started."
+            case .knownSourcePolicyNetworkFailure: return "SideStore could not update its own known-source safety list."
+            case .knownSourcePolicyInvalidResponse: return "SideStore could not read its own known-source safety list."
+            case .catalogUnavailable: return "SideStore could not read this source's saved catalog data."
+            case .catalogSourceUnavailable: return "This source is no longer in the SideStore source list."
+            case .responseEncodingFailed: return "SideStore could not encode the response for this request."
+            case .responseTooLarge: return "SideStore produced a response that is too large to transfer."
+            case .pairingRequired: return "A pairing file is required before this device can be refreshed."
+            case .invalidPairingFile: return "SideStore could not read or validate the pairing file."
+            case .authAttemptNotDispatched: return "SideStore did not start this sign-in attempt, so Apple authentication was not submitted."
+            case .authProvisioningRetryNotDispatched: return "SideStore did not start the provisioning retry; the saved authentication session was not changed by this request."
+            case .authSessionUnavailable: return "SideStore no longer has the active sign-in session."
+            case .authResponseCapacityUnavailable: return "SideStore could not start sign-in because it cannot safely reserve a response slot yet."
+            }
+        }
         switch stage {
         case .hostContainer: return "SideStore could not start because the authoritative host container is unavailable."
         case .storagePreparation: return "SideStore could not start because its existing data storage could not be prepared."
@@ -120,33 +328,271 @@ public struct CombinedFailure: Error, LocalizedError {
         case .lockdownConnection: return "The device transport opened, but the lockdownd connection failed."
         case .uniqueDeviceID: return "The device connection opened, but the UniqueDeviceID request failed."
         case .pairing: return "Pairing parsing, validation, or a concrete device trust check failed."
+        case .source:
+            switch sourceStep {
+            case .sourceDownload: return "The source could not be downloaded."
+            case .manifestParsing: return "The source returned data SideStore could not read as a valid source."
+            case .catalogRead: return "SideStore could not confirm that the source was saved or read from its catalog."
+            default: return "SideStore could not complete the source request."
+            }
+        case .catalog:
+            // The wording is supplied by catalogFailureMessage, which keys on the
+            // operation rather than on this stage.
+            return "SideStore could not load this source's catalog."
         case .authentication: return "SideStore could not complete account authentication."
-        case .signing: return "SideStore could not sign the application."
-        case .installation: return "SideStore could not complete the application installation."
+        case .provisioning: return "Apple sign-in succeeded, but device provisioning did not complete."
+        case .signing:
+            switch sourceStep {
+            case .provisioningProfileFetch:
+                return "SideStore could not retrieve the provisioning profile required for signing. The exact underlying cause could not be safely identified."
+            case .certificateValidation:
+                return "SideStore could not validate the signing certificate. The exact underlying cause could not be safely identified."
+            case .localCodeSigning:
+                return "SideStore could not sign the app locally. The exact underlying cause could not be safely identified."
+            default: break
+            }
+            return underlyingDomain == "redacted" && underlyingCode != 0
+                ? "SideStore could not sign the application. The exact underlying cause could not be safely identified."
+                : "SideStore could not sign the application."
+        case .filePreparation:
+            switch code {
+            case .invalidToken: return "The staged IPA reference is invalid. Select the file again."
+            case .missingFile: return "The staged IPA is no longer available. Select it again."
+            case .emptyFile: return "The selected IPA is empty and could not be installed."
+            case .invalidPackage: return "The selected file is not a valid IPA app package."
+            case .fileAccess: return "The selected IPA could not be read. Check file access and select it again."
+            default: return "The selected IPA could not be prepared for installation. Select it again."
+            }
+        case .installation:
+            // Apple-side application verification rejections carry fixed installd
+            // codes. These describe profile/identity rejection, never an account
+            // ban, and they do not imply a pairing or LocalDevVPN problem.
+            if hasApplicationVerificationEvidence && underlyingCode == 0xE8008024 {
+                return "iOS reports that the provisioning profile is banned during application verification. Recreating pairing or changing LocalDevVPN settings is unlikely to address this specific error."
+            }
+            if hasApplicationVerificationEvidence && underlyingCode == 0xE8008018 {
+                return "iOS reports that the identity used to sign the executable is no longer valid. The app must be re-signed with a current signing identity."
+            }
+            return "SideStore could not complete the application installation."
         case .refreshVerification: return "Refresh completion could not be verified from the installation results."
-        case .command: return "SideStore could not complete the requested \(operation) command (\(code.rawValue))."
+        case .network: return "Network error during the \(operation) operation."
+        case .replyEncoding: return "SideStore could not encode its service response."
+        case .command:
+            if underlyingDomain == "redacted" && underlyingCode != 0 {
+                return "SideStore could not start or complete the requested \(operation) action. The exact underlying cause could not be safely identified."
+            }
+            return "SideStore could not start or complete the requested \(operation) action."
         }
     }
+    // V3_CATALOG_FAILURE_VOCABULARY_V1: the exact sentence for each boundary a
+    // catalog read can fail at, selected by the real stage and code rather than
+    // by a generic fallback. The source manifest is never blamed here, because
+    // nothing on this path proves the manifest failed to parse.
+    private var catalogFailureMessage: String? {
+        if safeCause == .catalogSourceUnavailable {
+            return "This source is no longer in the SideStore source list."
+        }
+        if code == .unavailable || code == .notReady || stage == .serviceReadiness {
+            return "The SideStore service is not ready to load this source yet."
+        }
+        if stage == .xpcConnection && code == .interrupted {
+            return "The connection to the SideStore service was interrupted while loading the source."
+        }
+        if code == .busy {
+            return "SideStore is still finishing another operation. Wait a moment, then reload the source."
+        }
+        if code == .invalidResponse {
+            return "SideStore returned an unreadable response while loading the source catalog."
+        }
+        if code == .timedOut {
+            return "The SideStore service did not answer while loading this source catalog."
+        }
+        if stage == .catalog { return "SideStore could not read this source's saved catalog." }
+        return nil
+    }
+
+    private var catalogFailureRecovery: String? {
+        if safeCause == .catalogSourceUnavailable {
+            return "Return to Sources and reload the source list, then open the source again if it is still present."
+        }
+        if code == .unavailable || code == .notReady || stage == .serviceReadiness {
+            return "Wait for SideStore to finish starting, then reload the source."
+        }
+        if code == .busy {
+            return "Wait for the current SideStore operation to finish, then reload the source."
+        }
+        if stage == .xpcConnection || code == .timedOut {
+            return "Wait for the SideStore service to become available, then reload the source."
+        }
+        return "Reload the source catalog. If it continues, copy the safe diagnostics."
+    }
+
     public var recovery: String {
+        // V3_RESPONSE_CLASSIFICATION_CARRIER_V1: the two reply-level causes
+        // outrank the catalog recovery for the same reason they outrank its
+        // message. Repeating an unencodable request, or the same oversized one,
+        // fails identically, so the catalog advice to reload would send the user
+        // in a circle.
+        if operation == "catalog", safeCause != .responseEncodingFailed,
+           safeCause != .responseTooLarge, let catalog = catalogFailureRecovery { return catalog }
+        if let safeCause {
+            switch safeCause {
+            case .networkConnectionLost, .networkTimedOut, .networkUnavailable:
+                return "Reconnect, check LocalDevVPN if enabled, and retry when the connection is stable."
+            case .signingNetworkConnectionLost, .signingNetworkTimedOut, .signingNetworkUnavailable:
+                return "Your current connection may still be healthy. Retry once. If this happens again, open Connection Settings."
+            case .developerPortalRejectedRequest, .developerPortalInvalidResponse:
+                return "Check Account & Signing and Certificates. If it repeats, keep these diagnostics for support before retrying."
+            case .provisioningProfileUnavailable, .certificateUnavailable:
+                return "Open Certificates and select or create a current signing certificate/profile before retrying."
+            case .wifiUnavailable, .localDevVPNUnavailable:
+                return "Restore the indicated connection prerequisite, then start a new refresh."
+            case .unknownSigningCause:
+                return "Check Account & Signing and Certificates. The exact underlying cause was not safely identified; keep these diagnostics before trying again."
+            case .sourceNetworkFailure:
+                return "Check the network connection and retry the source request."
+            case .sourceInvalidManifest:
+                return "Check the source provider's manifest format, then preview it again."
+            case .sourcePersistenceUnverified:
+                return "Return to Sources and reload the list. Confirm whether the source is present before submitting another add; copy Diagnostics if its status remains unclear."
+            case .sourceInvalidURL:
+                return "Enter a valid HTTP or HTTPS source URL, then preview it again."
+            case .sourceRemoveFailed:
+                return "Reload Sources and confirm whether the source is gone. If it remains, remove it again."
+            case .sourceRemoveBusy:
+                return "Wait for the current SideStore request to finish, reload Sources, then confirm removal again."
+            case .sourceAddBusy:
+                return "Wait for the current SideStore request to finish, reload Sources, then preview and confirm the add again."
+            case .operationInProgress:
+                return "Wait for the active SideStore request to finish, check the action's current state, then retry that action if needed."
+            case .responseCapacityUnavailable:
+                return "Wait for SideStore to release earlier request results, check the current state, then retry this action."
+            case .staleRefreshAttempt:
+                return "Return to Refresh and start a new refresh. This stale request did not reach SideStore or the device."
+            case .knownSourcePolicyNetworkFailure:
+                return "Check the network, then retry from Sources. This error came from SideStore's known-source safety list, not the URL you entered."
+            case .knownSourcePolicyInvalidResponse:
+                return "Try again later. If SideStore keeps receiving unreadable safety-list data, copy Diagnostics and report it."
+            case .catalogUnavailable:
+                return "Reload the catalog. If it continues, copy the safe diagnostics."
+            case .catalogSourceUnavailable:
+                return "Return to Sources and reload the source list, then open the source again."
+            case .responseEncodingFailed:
+                return "The same request cannot fix this reply-encoding failure. Copy Diagnostics and report that the service could not encode its response."
+            case .responseTooLarge:
+                return "The service reply exceeded the transfer limit. Copy Diagnostics and report this response-size issue; repeating the same request will fail again."
+            case .pairingRequired:
+                return "Add the pairing file, then retry the refresh."
+            case .invalidPairingFile:
+                return "Open Pairing File and replace the saved pairing file with a valid one, then retry."
+            case .authAttemptNotDispatched:
+                if code == .busy {
+                    return "Wait for the active SideStore operation to finish, then start sign-in again."
+                }
+                if stage == .serviceReadiness {
+                    return "Wait for SideStore to finish starting, then start sign-in again."
+                }
+                return "Resolve the displayed prerequisite, then start sign-in again."
+            case .authProvisioningRetryNotDispatched:
+                if code == .busy {
+                    return "Wait for the active SideStore operation to finish, then retry provisioning."
+                }
+                if stage == .serviceReadiness {
+                    return "Wait for SideStore to finish starting, then retry provisioning."
+                }
+                return "Retry provisioning when the displayed prerequisite is ready."
+            case .authSessionUnavailable:
+                return "Open Account & Signing and start a new sign-in. SideStore will reconcile the current account before proceeding."
+            case .authResponseCapacityUnavailable:
+                return "Wait for SideStore to release earlier request results, reload account status, then try again. No Apple credentials were submitted."
+            }
+        }
         switch stage {
-        case .hostContainer, .storagePreparation, .bookmarkCreation:
-            return "Keep existing data intact. Return to the host, check available storage, and use Retry Connection. Copy these diagnostics if it fails again."
+        case .command where operation == "delete" && code == .timedOut:
+            return "Reload the installed app list and verify the deletion before trying another delete."
+        case .hostContainer:
+            return "Reopen LiveContainer and check that it can access its shared App Group container. Keep existing data intact and copy diagnostics if the host container is still unavailable."
+        case .storagePreparation:
+            return "Check available storage and access to LiveContainer's shared App Group container. Keep existing data intact and copy diagnostics if preparation still fails."
+        case .bookmarkCreation:
+            return "LiveContainer could not create access to its internal shared SideStore folder. Check that the App Group container is available; copy diagnostics if the folder still cannot be accessed."
         case .extensionDiscovery:
-            return "Check that the installed combined package retains LiveProcess and its extension registration. Do not reset SideStore or guest data."
-        case .authentication, .signing: return "Review Account and Signing, then explicitly retry. Never share credentials or private keys."
+            return "The combined app could not find its embedded LiveProcess extension. Confirm that the installed app is the combined LiveContainer + SideStore package; do not reset SideStore or guest data. Copy diagnostics if it continues."
+        case .serviceReadiness:
+            return "Wait for SideStore to finish starting, then retry the request."
+        case .authentication, .provisioning, .signing: return "Review Account and Signing, then explicitly retry. Never share credentials or private keys."
+        case .source:
+            if operation == "sourceAddConfirmed" {
+                return "Return to Sources and reload the source list. Check whether it was added before retrying; copy Diagnostics if its status is still unclear."
+            }
+            return "Return to Sources and review the source result. Copy Diagnostics before retrying if its status is unclear."
+        case .catalog:
+            // The wording is supplied by catalogFailureRecovery, which keys on
+            // the operation rather than on this stage.
+            return "Reload the source catalog. If it continues, copy the safe diagnostics."
+        case .replyEncoding:
+            return "Copy Diagnostics and report the service reply-encoding failure. Repeating the same request will not fix it."
+        case .filePreparation: return "Choose the IPA again. SideStore will copy it into private shared staging before starting installation."
         case .installation, .refreshVerification: return "Reload authoritative app status and expiration before retrying. Completion may be uncertain."
-        case .endpointSelection, .heartbeat, .coreDevice, .cdTunnel, .rsdDiscovery, .rsdService, .lockdownConnection, .uniqueDeviceID:
+        case .endpointSelection, .heartbeat, .coreDevice, .cdTunnel, .rsdDiscovery, .rsdService, .lockdownConnection, .uniqueDeviceID, .network:
             return "Check LocalDevVPN and the device connection, then retry explicitly. This failure alone does not prove invalid pairing."
         default: return "Reconnect explicitly and reload authoritative status before repeating a mutation."
         }
     }
+    public var safeMessage: String {
+        if operation == "refresh", safeCause == nil {
+            return "Refresh failed during \(stage.rawValue), but no safe underlying cause was available."
+        }
+        if underlyingDomain == "redacted", underlyingCode != 0, safeCause == nil {
+            return message + " The exact underlying cause could not be safely identified."
+        }
+        return message
+    }
     public var technicalDetails: String {
-        "schema=1 operation=\(operation) stage=\(stage.rawValue) code=\(code.rawValue) correlation=\(correlationID) underlying_domain=\(underlyingDomain) underlying_code=\(underlyingCode) retryable=\(retryable.map(String.init) ?? "unknown")"
+        "schema=1 operation=\(operation) stage=\(stage.rawValue) code=\(code.rawValue) correlation=\(correlationID) underlying_domain=\(underlyingDomain) underlying_code=\(underlyingCode) retryable=\(retryable.map(String.init) ?? "unknown") source_step=\(sourceStep?.rawValue ?? "unknown") safe_cause=\(safeCause?.rawValue ?? "unknown")" + installVerdict + requestContextSuffix
+    }
+    // Appended only when present, so every existing diagnostic stays
+    // byte-identical.
+    private var requestContextSuffix: String {
+        guard let requestContext, !requestContext.isEmpty else { return "" }
+        return " " + requestContext
+    }
+    public mutating func annotatingRequest(requestedOperation: String, requestID: String) {
+        requestContext = "request_operation=\(requestedOperation) request_correlation=\(requestID)"
+    }
+    // V3_CATALOG_DIAGNOSTICS_V1: host-only catalog page context. Only the page
+    // offset and the returned row count are recorded; never the source
+    // identifier, app names, bundle identifiers, or response content.
+    public mutating func annotatingCatalogPage(cursor: Int) {
+        requestContext = "source_step=catalogRead page_cursor=\(cursor)"
+    }
+    // Bounded machine classification for Apple-side application verification
+    // rejections (InstallationProxy/installd). Only the two fixed installd
+    // codes produce a token; every other failure keeps the existing
+    // diagnostics byte-identical. Never an account-ban claim.
+    private var installVerdict: String {
+        guard hasApplicationVerificationEvidence else { return "" }
+        if underlyingCode == 0xE8008024 { return " installVerdict=profileBanned" }
+        if underlyingCode == 0xE8008018 { return " installVerdict=signingIdentityRejected" }
+        return ""
+    }
+    private var hasApplicationVerificationEvidence: Bool {
+        ["install", "update"].contains(operation) && stage == .installation && Self.verificationDomains.contains(underlyingDomain)
     }
     public var errorDescription: String? { message + "\n" + recovery + "\n" + technicalDetails }
+    /// Bind this semantic failure to the request/reply transaction carrying it.
+    /// Session IDs and request IDs are distinct: an auth poll can discover a
+    /// missing session while answering a different, current XPC request.
+    public func correlating(to id: String) -> CombinedFailure {
+        CombinedFailure(operation: operation, stage: stage, code: code, id: id,
+            underlying: NSError(domain: underlyingDomain, code: underlyingCode),
+            retryable: retryable, safeCause: safeCause, sourceStep: sourceStep)
+    }
     public var wire: [String: Any] {
         var result: [String: Any] = ["version": 1, "operation": operation, "stage": stage.rawValue, "code": code.rawValue,
             "correlationID": correlationID, "underlyingDomain": underlyingDomain, "underlyingCode": underlyingCode]
+        if let safeCause { result["safeCause"] = safeCause.rawValue }
+        if let sourceStep { result["sourceStep"] = sourceStep.rawValue }
         if let retryable { result["retryable"] = retryable }
         return result
     }
@@ -161,46 +607,268 @@ public struct CombinedFailure: Error, LocalizedError {
         return decode(value, expectedID: expectedID)
     }
     public static func decode(_ value: [String: Any], expectedID: String) -> CombinedFailure? {
-        guard Set(value.keys).isSubset(of: ["version", "operation", "stage", "code", "correlationID", "underlyingDomain", "underlyingCode", "retryable"]),
-              let version = value["version"] as? NSNumber, CFGetTypeID(version) != CFBooleanGetTypeID(),
-              value["version"] as? Int == 1, value["correlationID"] as? String == expectedID,
+        guard Set(value.keys).isSubset(of: ["version", "operation", "stage", "code", "correlationID", "underlyingDomain", "underlyingCode", "retryable", "safeCause", "sourceStep"]),
+              Self.strictInteger(value["version"]) == 1, value["correlationID"] as? String == expectedID,
               let operation = value["operation"] as? String, operations.contains(operation),
               let stageName = value["stage"] as? String, let stage = Stage(rawValue: stageName),
               let codeName = value["code"] as? String, let code = Code(rawValue: codeName),
               let domain = value["underlyingDomain"] as? String, domains.contains(domain) || domain == "redacted",
-              let numberValue = value["underlyingCode"] as? NSNumber, CFGetTypeID(numberValue) != CFBooleanGetTypeID(),
-              let number = value["underlyingCode"] as? Int else { return nil }
+              let number = Self.strictInteger(value["underlyingCode"]) else { return nil }
+        let safeCause: SafeCause?
+        if let rawCause = value["safeCause"] {
+            guard let causeName = rawCause as? String, let cause = SafeCause(rawValue: causeName) else { return nil }
+            safeCause = cause
+        } else { safeCause = nil }
+        let sourceStep: SourceStep?
+        if let rawStep = value["sourceStep"] {
+            guard let stepName = rawStep as? String, let step = SourceStep(rawValue: stepName) else { return nil }
+            sourceStep = step
+        } else { sourceStep = nil }
         if let retry = value["retryable"] {
             guard let bool = retry as? NSNumber, CFGetTypeID(bool) == CFBooleanGetTypeID() else { return nil }
         }
         return CombinedFailure(operation: operation, stage: stage, code: code, id: expectedID,
-            underlying: NSError(domain: domain, code: number), retryable: value["retryable"] as? Bool)
+            underlying: NSError(domain: domain, code: number), retryable: value["retryable"] as? Bool,
+            safeCause: safeCause, sourceStep: sourceStep)
     }
+
+    private static func strictInteger(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              ["c", "s", "i", "l", "q", "C", "S", "I", "L", "Q"].contains(String(cString: number.objCType)) else {
+            return nil
+        }
+        return number.intValue
+    }
+
     public static func preserving(_ error: Error?, operation: String, stage: Stage, code: Code = .failed, id: String, retryable: Bool? = nil) -> CombinedFailure {
         if let known = error as? CombinedFailure {
             return known
         }
         return CombinedFailure(operation: operation, stage: stage, code: code, id: id, underlying: error, retryable: retryable)
     }
-    public static func capture(_ error: Error, operation: String, stage: Stage, id: String) -> CombinedFailure {        if let known = error as? CombinedFailure { return known }
+    public static func capture(_ error: Error, operation: String, stage: Stage, id: String,
+                               retryable: Bool? = nil) -> CombinedFailure {
+        if let known = error as? CombinedFailure { return known }
+        if let refreshError = error as? CombinedRefreshVerificationError {
+            let code: Code = refreshError == .missingResult ? .missingResult : .staleResult
+            return CombinedFailure(operation: operation, stage: .refreshVerification, code: code, id: id, retryable: retryable)
+        }
+        if let fileFailure = error as? CombinedIPAFileError {
+            return CombinedFailure(operation: operation, stage: .filePreparation,
+                                  code: fileFailure.combinedCode, id: id, underlying: fileFailure, retryable: retryable)
+        }
         var cause = error as NSError
         var resolved = stage
+        let resolvedCode: Code = error is CancellationError ? .cancelled : .failed
         var nativeCode: Int?
+        var nativeDomain: String?
+        var safeCause: SafeCause?
+        var sourceStep: SourceStep?
+        var ppqLocked = false
+        var explicitStageMarker = false
         // Only an allowlisted stage is inspected locally. No arbitrary userInfo is serialized.
         for _ in 0..<5 {
-            if cause.domain == "com.SideStore.Authentication" { resolved = .authentication }
-            if let name = cause.userInfo["LCStructuredFailureStageV1"] as? String, let found = Stage(rawValue: name) { resolved = found }
+            let fingerprint = cause.localizedDescription.lowercased()
+            let tokens = cause.localizedDescription.split(whereSeparator: { $0.isWhitespace })
+            if let name = cause.userInfo["LCStructuredFailureStageV1"] as? String,
+               let found = Stage(rawValue: name) {
+                resolved = found
+                explicitStageMarker = true
+            } else if let token = tokens.first(where: { $0.hasPrefix("lc_stage=") }),
+                      let found = Stage(rawValue: String(token.dropFirst(9))) {
+                resolved = found
+                explicitStageMarker = true
+            }
+            if let name = cause.userInfo["LCStructuredFailureCauseV1"] as? String,
+               let found = SafeCause(rawValue: name) {
+                safeCause = found
+            }
+            if let name = cause.userInfo["LCStructuredFailureSourceV1"] as? String,
+               let found = SourceStep(rawValue: name) {
+                sourceStep = found
+            }
+            // Domain-specific classification. Only map a numeric code to a
+            // stage when the (domain, code) pair has an established meaning.
+            // Otherwise preserve the caller stage and keep the underlying
+            // domain/code for diagnostics. Unknown stays unknown.
+            // Explicit stage markers from SideStore's pipeline take precedence
+            // over a broader gateway domain.
+            if !ppqLocked && !explicitStageMarker {
+                switch cause.domain {
+                case "com.SideStore.Authentication":
+                    resolved = .authentication
+                case "NSPOSIXErrorDomain":
+                    // POSIX error domains carry standard errno values.
+                    resolved = .network
+                case "NSURLErrorDomain":
+                    resolved = .network
+                case "MinimuxerError", "DeviceGatewayError", "IdeviceGatewayError":
+                    resolved = .command
+                default:
+                    break
+                }
+            }
+            // Apple-side installation rejection (InstallationProxy/installd
+            // application verification). The hex installer codes are matched
+            // case-insensitively alongside the verification marker; the stage
+            // is installation and the numeric code is preserved with the
+            // cause's own allowlisted domain (never a fabricated one).
+            // 0xE8008024: provisioning profile banned. 0xE8008018: signing
+            // identity no longer valid. Neither implies pairing, network,
+            // CoreDevice, or account-ban conditions.
+            let installContext = ["install", "installURL", "installSharedIPA", "update"].contains(operation)
+                && (stage == .installation || stage == .command)
+            let explicitContextAllowsVerification = !explicitStageMarker || resolved == .command || resolved == .installation
+            let typedVerificationSource = verificationDomains.contains(cause.domain)
+            let profileRejectionEvidence = fingerprint.contains("e8008024")
+                && fingerprint.contains("applicationverificationfailed")
+                && fingerprint.contains("provisioning profile")
+                && (fingerprint.contains("banned") || fingerprint.contains("revoked")
+                    || fingerprint.contains("invalid") || fingerprint.contains("failed to verify"))
+            let signingIdentityEvidence = fingerprint.contains("e8008018")
+                && fingerprint.contains("applicationverificationfailed")
+                && fingerprint.contains("identity used to sign")
+                && (fingerprint.contains("no longer valid") || fingerprint.contains("invalid")
+                    || fingerprint.contains("expired") || fingerprint.contains("revoked"))
+            if installContext && explicitContextAllowsVerification && typedVerificationSource {
+                if profileRejectionEvidence {
+                    resolved = .installation
+                    nativeCode = 0xE8008024
+                    if nativeDomain == nil, domains.contains(cause.domain) { nativeDomain = cause.domain }
+                    ppqLocked = true
+                } else if signingIdentityEvidence {
+                    resolved = .installation
+                    nativeCode = 0xE8008018
+                    if nativeDomain == nil, domains.contains(cause.domain) { nativeDomain = cause.domain }
+                    ppqLocked = true
+                }
+            }
             // Upstream gateway/Minimuxer typed errors carry a reason string. Inspect only
             // our fixed machine tokens locally; never forward the reason itself.
-            let tokens = cause.localizedDescription.split(whereSeparator: { $0.isWhitespace })
-            for token in tokens {
-                if token.hasPrefix("lc_stage="), let found = Stage(rawValue: String(token.dropFirst(9))) { resolved = found }
-                if token.hasPrefix("lc_native_code=") { nativeCode = Int(token.dropFirst(15)) }
+            // A preserved numeric code keeps the domain it was actually observed
+            // in: gateway tokens stay in their gateway domain, HTTP statuses use
+            // the fixed HTTPStatus domain, and POSIX errnos stay in
+            // NSPOSIXErrorDomain. No unrelated code is ever relabelled as a
+            // gateway error.
+            for (index, token) in tokens.enumerated() {
+                guard !ppqLocked else { continue }
+                if token.hasPrefix("lc_native_code="), let code = Int(token.dropFirst(15)) {
+                    nativeCode = code
+                    if ["MinimuxerError", "DeviceGatewayError", "IdeviceGatewayError"].contains(cause.domain) {
+                        nativeDomain = cause.domain
+                    }
+                }
+                // HTTP status in "HTTP 503" form (tokens are whitespace-split).
+                if (token == "HTTP" || token == "http"), index + 1 < tokens.count,
+                   let code = Int(tokens[index + 1]) {
+                    nativeCode = code
+                    nativeDomain = "HTTPStatus"
+                }
+                // POSIX errno in "errno=20" / "errno:20" form.
+                if token.hasPrefix("errno=") || token.hasPrefix("errno:") {
+                    if let code = Int(token.dropFirst(6)) {
+                        nativeCode = code
+                        nativeDomain = "NSPOSIXErrorDomain"
+                    }
+                }
             }
             if let next = cause.userInfo[NSUnderlyingErrorKey] as? NSError { cause = next } else { break }
         }
+        let underlying: NSError
+        if let code = nativeCode {
+            if let domain = nativeDomain {
+                underlying = NSError(domain: domain, code: code)
+            } else if domains.contains(cause.domain) {
+                underlying = NSError(domain: cause.domain, code: code)
+            } else {
+                underlying = NSError(domain: "redacted", code: code)
+            }
+        } else {
+            underlying = cause
+        }
+        if safeCause == nil && (resolved == .signing || resolved == .network) && cause.domain == NSURLErrorDomain {
+            switch cause.code {
+            case NSURLErrorNetworkConnectionLost:
+                safeCause = resolved == .signing ? .signingNetworkConnectionLost : .networkConnectionLost
+            case NSURLErrorTimedOut:
+                safeCause = resolved == .signing ? .signingNetworkTimedOut : .networkTimedOut
+            case NSURLErrorNotConnectedToInternet, NSURLErrorCannotConnectToHost, NSURLErrorCannotFindHost:
+                safeCause = resolved == .signing ? .signingNetworkUnavailable : .networkUnavailable
+            default: break
+            }
+        }
         return CombinedFailure(operation: operation, stage: resolved,
-            code: error is CancellationError ? .cancelled : .failed, id: id,
-            underlying: nativeCode.map { NSError(domain: "DeviceGatewayError", code: $0) } ?? cause)
+            code: resolvedCode, id: id,
+            underlying: underlying, retryable: retryable, safeCause: safeCause, sourceStep: sourceStep)
+    }
+}
+
+public enum CombinedRefreshVerificationError: Error, Equatable {
+    case missingResult
+    case staleResult
+}
+
+public struct CombinedIPAFileError: Error, LocalizedError, CustomNSError {
+    public enum Problem: String, Equatable {
+        case invalidToken, missingFile, emptyFile, invalidPackage, fileAccess, stagingFailed
+    }
+    public let problem: Problem
+    public static let errorDomain = "V3IPAFileErrorDomain"
+    public var errorCode: Int {
+        switch problem {
+        case .invalidToken: return 1
+        case .missingFile: return 2
+        case .emptyFile: return 3
+        case .invalidPackage: return 4
+        case .fileAccess: return 5
+        case .stagingFailed: return 6
+        }
+    }
+    public var errorUserInfo: [String: Any] { [NSLocalizedDescriptionKey: errorDescription ?? "IPA file preparation failed."] }
+    public init(_ problem: Problem) { self.problem = problem }
+    public var combinedCode: CombinedFailure.Code {
+        switch problem {
+        case .invalidToken: return .invalidToken
+        case .missingFile: return .missingFile
+        case .emptyFile: return .emptyFile
+        case .invalidPackage: return .invalidPackage
+        case .fileAccess: return .fileAccess
+        case .stagingFailed: return .stagingFailed
+        }
+    }
+    public var errorDescription: String? {
+        switch problem {
+        case .invalidToken: return "The staged IPA reference is invalid."
+        case .missingFile: return "The staged IPA is no longer available."
+        case .emptyFile: return "The selected IPA is empty."
+        case .invalidPackage: return "The selected file is not a valid IPA app package."
+        case .fileAccess: return "The selected IPA could not be read."
+        case .stagingFailed: return "The selected IPA could not be staged."
+        }
+    }
+}
+
+private func v3StrictPlistInteger(_ value: Any?) -> Int? {
+    guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+          ["c", "s", "i", "l", "q", "C", "S", "I", "L", "Q"].contains(String(cString: number.objCType)) else {
+        return nil
+    }
+    return number.intValue
+}
+
+enum V3NotDispatchedReplyPolicy {
+    static func confirms(_ data: Data, requestID: String, maximumBytes: Int) -> Bool {
+        guard maximumBytes > 0, !data.isEmpty, data.count <= maximumBytes,
+              let reply = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              v3StrictPlistInteger(reply["version"]) == 1,
+              reply["id"] as? String == requestID,
+              reply["error"] as? String != nil,
+              reply["result"] == nil,
+              reply["ok"] == nil,
+              let notDispatched = reply["operationNotDispatched"] as? NSNumber,
+              CFGetTypeID(notDispatched) == CFBooleanGetTypeID(), notDispatched.boolValue,
+              let failure = reply["failure"] as? [String: Any],
+              CombinedFailure.decode(failure, expectedID: requestID) != nil else { return false }
+        return true
     }
 }
