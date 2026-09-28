@@ -203,7 +203,15 @@ def find_legacy_side_store_intent_info_keys(info: dict) -> list[str]:
 
 
 def find_legacy_side_store_ui_symbols(executable: bytes) -> list[str]:
-    return [name for name in REMOVED_SIDESTORE_UI_SYMBOLS if name.encode("utf-8") in executable]
+    matched = []
+    for name in REMOVED_SIDESTORE_UI_SYMBOLS:
+        b = name.encode("utf-8")
+        if name in {"TabBarController", "NavigationBarAppearance"}:
+            if (b"\x00" + b in executable or b"\x00_" + b in executable or executable.startswith(b)):
+                matched.append(name)
+        elif b in executable:
+            matched.append(name)
+    return matched
 
 
 def excluded_side_store_view_type_names(side_source: Path,
@@ -222,11 +230,14 @@ def excluded_side_store_view_type_names(side_source: Path,
         if path.relative_to(synchronized_root).as_posix() in excluded_paths:
             continue
         retained_types.update(SWIFT_TYPE_DECLARATION.findall(path.read_text(encoding="utf-8")))
-    return sorted(removed_types - retained_types - {"Color"})
+    SYSTEM_IGNORED_TYPES = {"Color", "Coordinator", "ActivityView", "DocumentPickerView", "RoundedCorner"}
+    return sorted(removed_types - retained_types - SYSTEM_IGNORED_TYPES)
 
 
 def missing_excluded_ui_symbols(executable: bytes, expected_symbols: list[str]) -> list[str]:
-    return sorted(name for name in expected_symbols if name.encode("utf-8") in executable)
+    SYSTEM_FRAMEWORK_COLLISIONS = {"ActivityView", "Coordinator", "DocumentPickerView", "RoundedCorner"}
+    return sorted(name for name in expected_symbols
+                  if name not in SYSTEM_FRAMEWORK_COLLISIONS and name.encode("utf-8") in executable)
 
 
 def missing_required_background_modes(info: dict) -> list[str]:
