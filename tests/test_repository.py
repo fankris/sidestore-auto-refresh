@@ -73,6 +73,7 @@ class RepositoryTests(unittest.TestCase):
             REQUIRED_SCRIPTS | {LIVE_CONTAINER_SCRIPT, LIVE_CONTAINER_STARTUP_SCRIPT,
                                 COMBINED_REFRESH_SCRIPT, EMBEDDED_KEYCHAIN_SCRIPT, 'audit_ipa_signing.py', 'patch_guest_return.py',
                                 'package_livecontainer_combined.py', 'patch_combined_transport.py', 'patch_refresh_result_bridge.py',
+                                'patch_sidesign_gsa_client_info.py',
                                 APP_LAYOUT_SCRIPT},
         )
 

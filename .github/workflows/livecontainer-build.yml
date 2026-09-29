@@ -3,7 +3,10 @@ name: LiveContainer embedded SideStore build
 on:
   workflow_dispatch:
   push:
-    branches: [fix/combined-refresh-build-and-runtime]
+    branches:
+      - main
+      - align-nrg-clean
+      - fix/combined-refresh-build-and-runtime
 
 permissions:
   contents: read
@@ -117,6 +120,9 @@ jobs:
           PY
             python3 builder/scripts/patch_combined_refresh_contract.py work/EmbeddedSideStore
             python3 builder/scripts/patch_combined_refresh_contract.py work/EmbeddedSideStore
+            python3 builder/scripts/patch_sidesign_gsa_client_info.py work/EmbeddedSideStore/Dependencies/SideSign
+            python3 builder/scripts/patch_sidesign_gsa_client_info.py work/EmbeddedSideStore/Dependencies/SideSign
+            swiftc -frontend -parse work/EmbeddedSideStore/Dependencies/SideSign/Sources/DeveloperPortal/Authentication.swift
             swiftc -frontend -parse work/LiveContainer/LiveContainerSwiftUI/App/AppDelegate.swift
             swiftc -frontend -parse work/LiveContainer/LiveContainerSwiftUI/App/LiveContainerAutoRefreshAlarm.swift
             swiftc -frontend -parse work/LiveContainer/LiveContainerSwiftUI/Views/Settings/LCEmbeddedSideStoreRefreshView.swift
